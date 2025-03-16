@@ -28,8 +28,6 @@ def install_dependencies():
             print("You can create a venv with: python3 -m venv .venv")
             print("And activate it with: source .venv/bin/activate")
 
-install_dependencies()
-
 def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, lra_max=9.0, num_processes=max(1, cpu_count() - 1)):
     """
     Analyzes an audio file and adjusts its loudness to the target LUFS, considering true peak limits.
