@@ -520,21 +520,13 @@ def parallel_normalize_audio(input_files, output_files, target_lufs=-16.0, true_
 
 def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_peak_limit=-1.0, 
                            lra_max=9.0, num_processes=max(1, cpu_count() - 1), 
-                           chunk_size=10.0):  # chunk size in seconds
+                           chunk_size=10.0):
     """
     Process audio in a streaming fashion with minimal memory usage and better CPU utilization.
-    
-    Args:
-        input_file: Input audio file path
-        output_file: Output audio file path
-        target_lufs: Target LUFS loudness
-        true_peak_limit: True peak limit in dBTP
-        lra_max: Maximum loudness range target
-        num_processes: Number of CPU cores to use
-        chunk_size: Size of each processing chunk in seconds
     """
     import tempfile
     from scipy import signal
+    import os
     
     print(f"Streaming audio processing: {input_file} -> {output_file}")
     
@@ -551,8 +543,7 @@ def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_pea
     # Initialize meter with same rate
     meter = pyln.Meter(rate)
     
-    # LRA analysis - needs to be done on full file but with memory-efficient method
-    # Use a two-pass approach - first for LRA analysis, second for actual processing
+    # LRA analysis
     lra_info = analyze_lra_streaming(input_file, rate, meter, lra_max)
     print(f"Loudness analysis completed: {lra_info['loudness']:.2f} LUFS, LRA: {lra_info['lra']:.2f} LU")
     
@@ -560,96 +551,64 @@ def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_pea
     gain = target_lufs - lra_info['loudness']
     print(f"Target loudness: {target_lufs:.2f} LUFS (gain: {gain:.2f} dB)")
     
-    # Create temp files for multi-stage processing
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp1, \
-         tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp2:
-        
-        temp1_path = temp1.name
-        temp2_path = temp2.name
+    # Create temp files with unique suffixes for multi-stage processing
+    temp1_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+    temp1_path = temp1_file.name
+    temp1_file.close()
+    
+    temp2_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+    temp2_path = temp2_file.name
+    temp2_file.close()
+    
+    current_file = input_file
     
     try:
-        # Parallel processing pipeline using multiple temporary files
-        stages = []
-        
         # Stage 1: Apply dynamic range compression if needed
         if lra_max > 0 and lra_info['lra'] > lra_max:
             print(f"Stage 1: Applying dynamic range compression {lra_info['lra']:.2f} -> {lra_max:.2f} LU")
-            stages.append({
-                'input': input_file,
-                'output': temp1_path,
-                'function': apply_compression_streaming,
-                'args': {
-                    'threshold': lra_info['threshold'],
-                    'ratio': lra_info['ratio'],
-                    'meter': meter,
-                    'chunk_seconds': chunk_size
-                }
-            })
-            input_for_next_stage = temp1_path
+            apply_compression_streaming(
+                current_file, 
+                temp1_path,
+                threshold=lra_info['threshold'],
+                ratio=lra_info['ratio'],
+                meter=meter,
+                chunk_seconds=chunk_size
+            )
+            print("Stage 1: Compression completed")
+            current_file = temp1_path
         else:
             print("Stage 1: Dynamic range compression not needed")
-            input_for_next_stage = input_file
-            
+        
         # Stage 2: Apply LUFS gain
         print(f"Stage 2: Applying LUFS gain of {gain:.2f} dB")
-        stages.append({
-            'input': input_for_next_stage,
-            'output': temp2_path,
-            'function': apply_gain_streaming,
-            'args': {
-                'gain': gain,
-                'chunk_seconds': chunk_size
-            }
-        })
-        input_for_next_stage = temp2_path
+        apply_gain_streaming(
+            current_file,
+            temp2_path,
+            gain=gain,
+            chunk_seconds=chunk_size
+        )
+        print("Stage 2: Gain application completed")
+        current_file = temp2_path
         
-        # Stage 3: Apply limiting if needed - analyze true peak first
-        true_peak = measure_true_peak_streaming(input_for_next_stage, chunk_size)
+        # Stage 3: Measure true peak after gain application
+        print("Measuring true peak after gain...")
+        true_peak = measure_true_peak_streaming(current_file, chunk_size)
         print(f"True peak after gain: {true_peak:.2f} dBTP")
         
+        # Apply limiting if needed
         if true_peak > true_peak_limit:
             print(f"Stage 3: Applying true peak limiting {true_peak:.2f} -> {true_peak_limit:.2f} dBTP")
-            stages.append({
-                'input': input_for_next_stage,
-                'output': output_file,
-                'function': apply_limiter_streaming,
-                'args': {
-                    'true_peak_limit': true_peak_limit,
-                    'release_time': 0.050,
-                    'chunk_seconds': chunk_size
-                }
-            })
+            apply_limiter_streaming(
+                current_file,
+                output_file,
+                true_peak_limit=true_peak_limit,
+                release_time=0.050,
+                chunk_seconds=chunk_size
+            )
+            print("Stage 3: Limiting completed")
         else:
-            print("Stage 3: True peak limiting not needed")
-            # Simply copy the last temp file to output
-            stages.append({
-                'input': input_for_next_stage,
-                'output': output_file,
-                'function': copy_audio_streaming,
-                'args': {
-                    'chunk_seconds': chunk_size
-                }
-            })
-        
-        # Process all stages, potentially in parallel for non-dependent stages
-        if num_processes > 1 and len(stages) > 1:
-            # Use a process pool for parallel stage execution where possible
-            with Pool(processes=min(num_processes, len(stages))) as pool:
-                # We can only parallelize independent stages
-                results = []
-                for stage in stages:
-                    # Create a function that wraps the stage processing
-                    results.append(pool.apply_async(process_stage, (stage,)))
-                
-                # Wait for all processes to complete
-                for i, result in enumerate(results):
-                    result.get()  # Wait for completion and get result
-                    print(f"Completed stage {i+1}/{len(stages)}")
-        else:
-            # Process stages sequentially
-            for i, stage in enumerate(stages):
-                process_stage(stage)
-                print(f"Completed stage {i+1}/{len(stages)}")
+            print("Stage 3: True peak limiting not needed, copying file...")
+            copy_audio_streaming(current_file, output_file, chunk_seconds=chunk_size)
         
         # Verify final output
         final_loudness = measure_loudness_streaming(output_file, meter, chunk_size)
@@ -662,9 +621,10 @@ def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_pea
         # Clean up temporary files
         for path in [temp1_path, temp2_path]:
             try:
-                os.unlink(path)
-            except:
-                pass
+                if os.path.exists(path):
+                    os.unlink(path)
+            except Exception as e:
+                print(f"Warning: Could not delete temporary file {path}: {e}")
 
 def process_stage(stage):
     """Process a single stage in the audio pipeline"""
