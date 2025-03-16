@@ -520,32 +520,134 @@ def parallel_normalize_audio(input_files, output_files, target_lufs=-16.0, true_
 
 def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_peak_limit=-1.0, 
                            lra_max=9.0, num_processes=max(1, cpu_count() - 1), 
-                           chunk_size=10.0):
+                           chunk_size=10.0, use_cache=True):
     """
     Process audio in a streaming fashion with minimal memory usage and better CPU utilization.
+    
+    Args:
+        input_file: Input audio file path
+        output_file: Output audio file path
+        target_lufs: Target LUFS loudness
+        true_peak_limit: Maximum true peak level in dBTP
+        lra_max: Maximum loudness range in LU
+        num_processes: Number of processes to use for parallel processing
+        chunk_size: Size of each processing chunk in seconds
+        use_cache: Whether to cache loudness analysis results
     """
     import tempfile
     from scipy import signal
     import os
+    import json
+    import hashlib
+    import time
     
-    print(f"Streaming audio processing: {input_file} -> {output_file}")
+    print("\n========== LUFS AUDIO NORMALIZER ==========")
+    print(f"Input file: {input_file}")
+    print(f"Output file: {output_file}")
+    print(f"Processing settings:")
+    print(f"  • Target LUFS: {target_lufs:.1f} LUFS")
+    print(f"  • True peak limit: {true_peak_limit:.1f} dBTP")
+    print(f"  • Max LRA: {lra_max:.1f} LU")
+    print(f"  • Processes: {num_processes}")
+    print(f"  • Chunk size: {chunk_size:.1f} seconds")
+    print("==========================================\n")
     
-    # Step 1: Analyze file properties and loudness (in streaming fashion)
-    with sf.SoundFile(input_file, 'r') as f:
-        rate = f.samplerate
-        channels = f.channels
-        subtype = f.subtype
-        frames = f.frames
-        duration = frames / rate
+    # First check if input file exists and is supported
+    if not os.path.exists(input_file):
+        print(f"Error: Input file '{input_file}' does not exist")
+        return
+    
+    # Check if file format is supported, convert if needed
+    try:
+        with sf.SoundFile(input_file, 'r') as f:
+            rate = f.samplerate
+            channels = f.channels
+            subtype = f.subtype
+            frames = f.frames
+            duration = frames / rate
+    except Exception as e:
+        print(f"Error opening audio file: {e}")
+        print("Attempting to convert using ffmpeg...")
         
+        # Try to convert using ffmpeg if installed
+        try:
+            import subprocess
+            temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+            temp_wav_path = temp_wav.name
+            temp_wav.close()
+            
+            # Convert to WAV using ffmpeg
+            cmd = ["ffmpeg", "-i", input_file, "-y", temp_wav_path]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            print(f"Converted input file to WAV format: {temp_wav_path}")
+            input_file = temp_wav_path
+            
+            # Now try to open the converted file
+            with sf.SoundFile(input_file, 'r') as f:
+                rate = f.samplerate
+                channels = f.channels
+                subtype = f.subtype
+                frames = f.frames
+                duration = frames / rate
+                
+        except Exception as convert_error:
+            print(f"Error converting file: {convert_error}")
+            print("This file format is not supported. Please provide WAV, FLAC, or OGG files.")
+            return
+    
     print(f"Audio properties: {rate}Hz, {channels} channels, {duration:.1f}s, format: {subtype}")
     
     # Initialize meter with same rate
     meter = pyln.Meter(rate)
     
-    # LRA analysis
-    lra_info = analyze_lra_streaming(input_file, rate, meter, lra_max)
-    print(f"Loudness analysis completed: {lra_info['loudness']:.2f} LUFS, LRA: {lra_info['lra']:.2f} LU")
+    # Calculate cache key based on file path and modification time
+    file_stat = os.stat(input_file)
+    file_hash = hashlib.md5(f"{input_file}:{file_stat.st_mtime}:{file_stat.st_size}".encode()).hexdigest()
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lufs_cache")
+    cache_file = os.path.join(cache_dir, f"{file_hash}.json")
+    
+    # Try to load from cache if enabled
+    lra_info = None
+    if use_cache:
+        try:
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir)
+                
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r') as f:
+                    cached_data = json.load(f)
+                    # Verify the cached data matches our file
+                    if cached_data.get("file") == input_file and \
+                       cached_data.get("mtime") == file_stat.st_mtime and \
+                       cached_data.get("size") == file_stat.st_size:
+                        lra_info = cached_data.get("lra_info")
+                        print(f"Using cached loudness analysis from {cache_file}")
+        except Exception as cache_error:
+            print(f"Warning: Cache read error: {cache_error}")
+    
+    # Perform analysis if not in cache
+    if lra_info is None:
+        print("Performing loudness analysis...")
+        lra_info = analyze_lra_streaming(input_file, rate, meter, lra_max)
+        
+        # Save to cache if enabled
+        if use_cache:
+            try:
+                cache_data = {
+                    "file": input_file,
+                    "mtime": file_stat.st_mtime,
+                    "size": file_stat.st_size,
+                    "date": time.time(),
+                    "lra_info": lra_info
+                }
+                with open(cache_file, 'w') as f:
+                    json.dump(cache_data, f)
+                print(f"Saved loudness analysis to cache: {cache_file}")
+            except Exception as cache_error:
+                print(f"Warning: Cache write error: {cache_error}")
+    
+    print(f"Loudness analysis: {lra_info['loudness']:.2f} LUFS, LRA: {lra_info['lra']:.2f} LU")
     
     # Calculate target gain
     gain = target_lufs - lra_info['loudness']
@@ -926,9 +1028,13 @@ def main():
                           help=f"Number of processes to use (default: {max(1, cpu_count() - 1)})")
     perf_group.add_argument("-c", "--chunk_size", type=float, default=5.0,
                           help="Size of processing chunks in seconds (default: 5.0)")
+    perf_group.add_argument("--no-cache", action="store_true", 
+                          help="Disable caching of loudness analysis results")
     
     # Handle the remaining arguments as lists of input/output files
     args, remaining = parser.parse_known_args()
+    
+    use_cache = not args.no_cache
     
     # Process the arguments based on the mode (single file vs batch)
     if args.batch or not (args.input_file and args.output_file):
@@ -954,13 +1060,13 @@ def main():
             process_audio_streaming(input_file, output_file, 
                                   args.target_lufs, args.true_peak,
                                   args.lra_max, args.num_processes, 
-                                  args.chunk_size)
+                                  args.chunk_size, use_cache)
     else:
         # Single file mode with streaming
         process_audio_streaming(args.input_file, args.output_file, 
                               args.target_lufs, args.true_peak,
                               args.lra_max, args.num_processes,
-                              args.chunk_size)
+                              args.chunk_size, use_cache)
 
 if __name__ == "__main__":
     freeze_support()
