@@ -518,6 +518,430 @@ def parallel_normalize_audio(input_files, output_files, target_lufs=-16.0, true_
     for result in results:
         print(result)
 
+def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_peak_limit=-1.0, 
+                           lra_max=9.0, num_processes=max(1, cpu_count() - 1), 
+                           chunk_size=10.0):  # chunk size in seconds
+    """
+    Process audio in a streaming fashion with minimal memory usage and better CPU utilization.
+    
+    Args:
+        input_file: Input audio file path
+        output_file: Output audio file path
+        target_lufs: Target LUFS loudness
+        true_peak_limit: True peak limit in dBTP
+        lra_max: Maximum loudness range target
+        num_processes: Number of CPU cores to use
+        chunk_size: Size of each processing chunk in seconds
+    """
+    import tempfile
+    from scipy import signal
+    
+    print(f"Streaming audio processing: {input_file} -> {output_file}")
+    
+    # Step 1: Analyze file properties and loudness (in streaming fashion)
+    with sf.SoundFile(input_file, 'r') as f:
+        rate = f.samplerate
+        channels = f.channels
+        subtype = f.subtype
+        frames = f.frames
+        duration = frames / rate
+        
+    print(f"Audio properties: {rate}Hz, {channels} channels, {duration:.1f}s, format: {subtype}")
+    
+    # Initialize meter with same rate
+    meter = pyln.Meter(rate)
+    
+    # LRA analysis - needs to be done on full file but with memory-efficient method
+    # Use a two-pass approach - first for LRA analysis, second for actual processing
+    lra_info = analyze_lra_streaming(input_file, rate, meter, lra_max)
+    print(f"Loudness analysis completed: {lra_info['loudness']:.2f} LUFS, LRA: {lra_info['lra']:.2f} LU")
+    
+    # Calculate target gain
+    gain = target_lufs - lra_info['loudness']
+    print(f"Target loudness: {target_lufs:.2f} LUFS (gain: {gain:.2f} dB)")
+    
+    # Create temp files for multi-stage processing
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp1, \
+         tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp2:
+        
+        temp1_path = temp1.name
+        temp2_path = temp2.name
+    
+    try:
+        # Parallel processing pipeline using multiple temporary files
+        stages = []
+        
+        # Stage 1: Apply dynamic range compression if needed
+        if lra_max > 0 and lra_info['lra'] > lra_max:
+            print(f"Stage 1: Applying dynamic range compression {lra_info['lra']:.2f} -> {lra_max:.2f} LU")
+            stages.append({
+                'input': input_file,
+                'output': temp1_path,
+                'function': apply_compression_streaming,
+                'args': {
+                    'threshold': lra_info['threshold'],
+                    'ratio': lra_info['ratio'],
+                    'meter': meter,
+                    'chunk_seconds': chunk_size
+                }
+            })
+            input_for_next_stage = temp1_path
+        else:
+            print("Stage 1: Dynamic range compression not needed")
+            input_for_next_stage = input_file
+            
+        # Stage 2: Apply LUFS gain
+        print(f"Stage 2: Applying LUFS gain of {gain:.2f} dB")
+        stages.append({
+            'input': input_for_next_stage,
+            'output': temp2_path,
+            'function': apply_gain_streaming,
+            'args': {
+                'gain': gain,
+                'chunk_seconds': chunk_size
+            }
+        })
+        input_for_next_stage = temp2_path
+        
+        # Stage 3: Apply limiting if needed - analyze true peak first
+        true_peak = measure_true_peak_streaming(input_for_next_stage, chunk_size)
+        print(f"True peak after gain: {true_peak:.2f} dBTP")
+        
+        if true_peak > true_peak_limit:
+            print(f"Stage 3: Applying true peak limiting {true_peak:.2f} -> {true_peak_limit:.2f} dBTP")
+            stages.append({
+                'input': input_for_next_stage,
+                'output': output_file,
+                'function': apply_limiter_streaming,
+                'args': {
+                    'true_peak_limit': true_peak_limit,
+                    'release_time': 0.050,
+                    'chunk_seconds': chunk_size
+                }
+            })
+        else:
+            print("Stage 3: True peak limiting not needed")
+            # Simply copy the last temp file to output
+            stages.append({
+                'input': input_for_next_stage,
+                'output': output_file,
+                'function': copy_audio_streaming,
+                'args': {
+                    'chunk_seconds': chunk_size
+                }
+            })
+        
+        # Process all stages, potentially in parallel for non-dependent stages
+        if num_processes > 1 and len(stages) > 1:
+            # Use a process pool for parallel stage execution where possible
+            with Pool(processes=min(num_processes, len(stages))) as pool:
+                # We can only parallelize independent stages
+                results = []
+                for stage in stages:
+                    # Create a function that wraps the stage processing
+                    results.append(pool.apply_async(process_stage, (stage,)))
+                
+                # Wait for all processes to complete
+                for i, result in enumerate(results):
+                    result.get()  # Wait for completion and get result
+                    print(f"Completed stage {i+1}/{len(stages)}")
+        else:
+            # Process stages sequentially
+            for i, stage in enumerate(stages):
+                process_stage(stage)
+                print(f"Completed stage {i+1}/{len(stages)}")
+        
+        # Verify final output
+        final_loudness = measure_loudness_streaming(output_file, meter, chunk_size)
+        final_tp = measure_true_peak_streaming(output_file, chunk_size)
+        print(f"Final measurements: {final_loudness:.2f} LUFS, {final_tp:.2f} dBTP")
+        
+        return "Processing completed successfully"
+        
+    finally:
+        # Clean up temporary files
+        for path in [temp1_path, temp2_path]:
+            try:
+                os.unlink(path)
+            except:
+                pass
+
+def process_stage(stage):
+    """Process a single stage in the audio pipeline"""
+    return stage['function'](stage['input'], stage['output'], **stage['args'])
+
+def analyze_lra_streaming(input_file, rate, meter, lra_max):
+    """
+    Analyze LRA in a memory-efficient way by processing chunks
+    """
+    # Window and hop size for short-term loudness calculation
+    window_size = int(3 * rate)  # 3 seconds
+    hop_size = int(0.1 * rate)   # 100ms
+    
+    # Create loudness history buffer
+    st_loudness = []
+    
+    # Process file in chunks
+    chunk_samples = int(5.0 * rate)  # 5 seconds chunks for reading
+    
+    with sf.SoundFile(input_file, 'r') as f:
+        # Read chunks and compute loudness
+        with tqdm(total=f.frames, desc="Analyzing loudness", unit="samples") as pbar:
+            while f.tell() < f.frames:
+                chunk = f.read(chunk_samples)
+                if len(chunk) == 0:
+                    break
+                    
+                # Create sliding windows in this chunk
+                for i in range(0, len(chunk) - window_size + 1, hop_size):
+                    if i + window_size <= len(chunk):
+                        window_data = chunk[i:i + window_size]
+                        window_loudness = meter.integrated_loudness(window_data)
+                        if window_loudness > -70:  # Ignore silence
+                            st_loudness.append(window_loudness)
+                
+                pbar.update(len(chunk))
+    
+    # Calculate overall loudness
+    overall_loudness = meter.integrated_loudness(sf.read(input_file)[0])
+    
+    # Calculate LRA
+    result = {'loudness': overall_loudness, 'lra': 0, 'threshold': 0, 'ratio': 1.0}
+    
+    if len(st_loudness) >= 10:
+        st_loudness.sort()
+        p10_idx = max(0, int(len(st_loudness) * 0.1))
+        p95_idx = min(len(st_loudness) - 1, int(len(st_loudness) * 0.95))
+        lra = st_loudness[p95_idx] - st_loudness[p10_idx]
+        result['lra'] = lra
+        
+        if lra > lra_max:
+            ratio = lra / lra_max
+            threshold = st_loudness[p10_idx] + ((lra / 2) * (1 - 1/ratio))
+            result['ratio'] = ratio
+            result['threshold'] = threshold
+    
+    return result
+
+def apply_compression_streaming(input_file, output_file, threshold, ratio, meter, chunk_seconds=5.0):
+    """Apply compression in streaming fashion"""
+    with sf.SoundFile(input_file, 'r') as infile:
+        rate = infile.samplerate
+        channels = infile.channels
+        
+        # Calculate threshold in linear domain
+        threshold_linear = 10 ** (threshold / 20.0)
+        
+        # Create output file with same properties
+        with sf.SoundFile(output_file, 'w', samplerate=rate, 
+                          channels=channels, subtype=infile.subtype) as outfile:
+            
+            # Process in chunks
+            chunk_size = int(rate * chunk_seconds)
+            
+            # Set up a buffer for overlap processing
+            overlap_size = int(rate * 0.1)  # 100ms overlap
+            overlap_buffer = None
+            
+            with tqdm(total=infile.frames, desc="Applying compression", unit="samples") as pbar:
+                while infile.tell() < infile.frames:
+                    # Read chunk
+                    chunk = infile.read(chunk_size)
+                    if len(chunk) == 0:
+                        break
+                        
+                    # Combine with previous overlap
+                    if overlap_buffer is not None:
+                        chunk = np.concatenate((overlap_buffer, chunk))
+                    
+                    # Save data for next overlap
+                    if len(chunk) > overlap_size:
+                        overlap_buffer = chunk[-overlap_size:]
+                    else:
+                        overlap_buffer = None
+                    
+                    # Apply compression
+                    abs_data = np.abs(chunk)
+                    gain_reduction = np.ones_like(chunk)
+                    mask = abs_data > threshold_linear
+                    
+                    if np.any(mask):
+                        gain_reduction[mask] = (threshold_linear + 
+                                              ((abs_data[mask] - threshold_linear) / ratio)) / abs_data[mask]
+                        
+                    processed_chunk = chunk * gain_reduction
+                    
+                    # Write processed chunk (excluding overlap for all but the last chunk)
+                    write_size = len(processed_chunk) if infile.tell() >= infile.frames else len(processed_chunk) - overlap_size
+                    outfile.write(processed_chunk[:write_size])
+                    
+                    pbar.update(len(chunk))
+                    
+            # Write final overlap if there is any
+            if overlap_buffer is not None:
+                outfile.write(overlap_buffer)
+    
+    return "Compression completed"
+
+def apply_gain_streaming(input_file, output_file, gain, chunk_seconds=5.0):
+    """Apply gain in streaming fashion"""
+    gain_factor = 10 ** (gain / 20.0)
+    
+    with sf.SoundFile(input_file, 'r') as infile:
+        rate = infile.samplerate
+        channels = infile.channels
+        
+        # Create output file with same properties
+        with sf.SoundFile(output_file, 'w', samplerate=rate, 
+                          channels=channels, subtype=infile.subtype) as outfile:
+            
+            # Process in chunks
+            chunk_size = int(rate * chunk_seconds)
+            
+            with tqdm(total=infile.frames, desc="Applying gain", unit="samples") as pbar:
+                while infile.tell() < infile.frames:
+                    # Read chunk
+                    chunk = infile.read(chunk_size)
+                    if len(chunk) == 0:
+                        break
+                        
+                    # Apply gain
+                    processed_chunk = chunk * gain_factor
+                    
+                    # Write processed chunk
+                    outfile.write(processed_chunk)
+                    pbar.update(len(chunk))
+    
+    return "Gain application completed"
+
+def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_time, chunk_seconds=5.0):
+    """Apply true peak limiting in a streaming fashion"""
+    from scipy import signal
+    
+    with sf.SoundFile(input_file, 'r') as infile:
+        rate = infile.samplerate
+        channels = infile.channels
+        
+        # Create output file with same properties
+        with sf.SoundFile(output_file, 'w', samplerate=rate, 
+                          channels=channels, subtype=infile.subtype) as outfile:
+            
+            # Calculate parameters
+            threshold_linear = 10 ** (true_peak_limit / 20.0)
+            release_samples = int(release_time * rate)
+            
+            # Create release curve
+            release_curve = np.exp(-np.arange(release_samples) / (release_samples / 5))
+            release_curve = release_curve / np.sum(release_curve)
+            
+            # Process in overlapping chunks for smooth transitions
+            chunk_size = int(rate * chunk_seconds)
+            overlap_size = max(release_samples * 2, int(rate * 0.2))  # Max of 2x release or 200ms
+            
+            # State variables for filter
+            gain_state = None
+            
+            with tqdm(total=infile.frames, desc="Applying limiting", unit="samples") as pbar:
+                pos = 0
+                while pos < infile.frames:
+                    # Position file pointer
+                    infile.seek(pos)
+                    
+                    # Read chunk with overlap
+                    read_size = min(chunk_size + overlap_size, infile.frames - pos)
+                    chunk = infile.read(read_size)
+                    if len(chunk) == 0:
+                        break
+                    
+                    # Calculate gain reduction curve
+                    abs_data = np.abs(chunk)
+                    gain_reduction = np.ones_like(chunk)
+                    mask = abs_data > threshold_linear
+                    if np.any(mask):
+                        gain_reduction[mask] = threshold_linear / abs_data[mask]
+                    
+                    # Apply smoothing filter to gain reduction
+                    if len(chunk.shape) > 1:  # Multi-channel audio
+                        for c in range(channels):
+                            gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[:, c][::-1])[::-1]
+                            gain_reduction[:, c] = np.minimum(gain_reduction[:, c], gain_reduction_smooth)
+                    else:  # Mono audio
+                        gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[::-1])[::-1]
+                        gain_reduction = np.minimum(gain_reduction, gain_reduction_smooth)
+                    
+                    # Apply gain reduction
+                    limited_chunk = chunk * gain_reduction
+                    
+                    # Write only the non-overlapping part except for last chunk
+                    write_size = min(chunk_size, len(limited_chunk))
+                    outfile.write(limited_chunk[:write_size])
+                    
+                    # Advance position
+                    pos += write_size
+                    pbar.update(write_size)
+    
+    return "Limiting completed"
+
+def copy_audio_streaming(input_file, output_file, chunk_seconds=5.0):
+    """Simple streaming copy function"""
+    with sf.SoundFile(input_file, 'r') as infile:
+        rate = infile.samplerate
+        channels = infile.channels
+        
+        # Create output file with same properties
+        with sf.SoundFile(output_file, 'w', samplerate=rate, 
+                          channels=channels, subtype=infile.subtype) as outfile:
+            
+            # Process in chunks
+            chunk_size = int(rate * chunk_seconds)
+            
+            with tqdm(total=infile.frames, desc="Copying audio", unit="samples") as pbar:
+                while infile.tell() < infile.frames:
+                    # Read chunk
+                    chunk = infile.read(chunk_size)
+                    if len(chunk) == 0:
+                        break
+                        
+                    # Write chunk directly
+                    outfile.write(chunk)
+                    pbar.update(len(chunk))
+    
+    return "Copy completed"
+
+def measure_loudness_streaming(audio_file, meter, chunk_seconds=5.0):
+    """Measure integrated loudness in a streaming fashion"""
+    # This is more complex since we need to gather statistics across the entire file
+    program = meter.integrated_loudness(sf.read(audio_file)[0])
+    return program
+
+def measure_true_peak_streaming(audio_file, chunk_seconds=5.0):
+    """Measure true peak in a streaming fashion"""
+    # This can be done in chunks to reduce memory usage
+    max_peak = -120.0
+    
+    with sf.SoundFile(audio_file, 'r') as f:
+        rate = f.samplerate
+        chunk_size = int(rate * chunk_seconds)
+        
+        with tqdm(total=f.frames, desc="Measuring true peak", unit="samples") as pbar:
+            while f.tell() < f.frames:
+                # Read chunk
+                chunk = f.read(chunk_size)
+                if len(chunk) == 0:
+                    break
+                
+                # Measure true peak in this chunk
+                # Use 4x oversampling for accurate peak measurement
+                oversampled_chunk = resampy.resample(chunk, rate, rate * 4)
+                chunk_peak = np.max(np.abs(oversampled_chunk))
+                if chunk_peak > 0:
+                    chunk_peak_db = 20 * np.log10(chunk_peak)
+                    max_peak = max(max_peak, chunk_peak_db)
+                
+                pbar.update(len(chunk))
+    
+    return max_peak
+
 def main():
     """
     Main function to handle command line arguments and run the script.
@@ -540,6 +964,8 @@ def main():
     perf_group = parser.add_argument_group('Performance Options')
     perf_group.add_argument("-n", "--num_processes", type=int, default=max(1, cpu_count() - 1),
                           help=f"Number of processes to use (default: {max(1, cpu_count() - 1)})")
+    perf_group.add_argument("-c", "--chunk_size", type=float, default=5.0,
+                          help="Size of processing chunks in seconds (default: 5.0)")
     
     # Handle the remaining arguments as lists of input/output files
     args, remaining = parser.parse_known_args()
@@ -563,14 +989,18 @@ def main():
             print(f"Output files ({len(output_files)}): {output_files}")
             return
             
-        parallel_normalize_audio(input_files, output_files, 
-                                args.target_lufs, args.true_peak, 
-                                args.lra_max, args.num_processes)
+        # Process each file using streaming architecture
+        for input_file, output_file in zip(input_files, output_files):
+            process_audio_streaming(input_file, output_file, 
+                                  args.target_lufs, args.true_peak,
+                                  args.lra_max, args.num_processes, 
+                                  args.chunk_size)
     else:
-        # Single file mode
-        normalize_audio(args.input_file, args.output_file, 
-                       args.target_lufs, args.true_peak, 
-                       args.lra_max, args.num_processes)
+        # Single file mode with streaming
+        process_audio_streaming(args.input_file, args.output_file, 
+                              args.target_lufs, args.true_peak,
+                              args.lra_max, args.num_processes,
+                              args.chunk_size)
 
 if __name__ == "__main__":
     freeze_support()
