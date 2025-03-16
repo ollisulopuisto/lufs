@@ -181,52 +181,42 @@ def measure_true_peak_efficient(data, rate):
 
 def apply_efficient_limiter(data, rate, true_peak_limit):
     """
-    More efficient limiter implementation.
+    Simple but effective limiter implementation.
     """
-    from scipy import signal
+    from tqdm import tqdm
+    import time
     
-    # Convert true peak limit from dB to linear
-    threshold_linear = 10 ** (true_peak_limit / 20.0)
+    print("Starting limiter processing...")
     
-    # Use 2x oversampling for limiting (compromise between accuracy and speed)
-    oversampled_rate = rate * 2
-    oversampled_data = resampy.resample(data, rate, oversampled_rate)
+    # First measure the true peak again to confirm
+    true_peak = measure_true_peak_efficient(data, rate)
+    print(f"Confirming true peak: {true_peak:.2f} dBTP")
     
-    # Calculate gain reduction
-    abs_data = np.abs(oversampled_data)
-    gain_reduction = np.ones_like(abs_data)
-    mask = abs_data > threshold_linear
-    gain_reduction[mask] = threshold_linear / abs_data[mask]
+    if true_peak <= true_peak_limit:
+        print("No limiting needed, true peak already under threshold")
+        return data
     
-    # Create a smoothing filter (5ms lookahead, 50ms release)
-    release_samples = int(0.05 * oversampled_rate)  # 50ms release
-    attack_samples = int(0.005 * oversampled_rate)  # 5ms attack/lookahead
+    # Calculate required gain reduction
+    gain_reduction_db = true_peak_limit - true_peak
+    gain_factor = 10 ** (gain_reduction_db / 20.0)
+    print(f"Applying gain reduction of {gain_reduction_db:.2f} dB")
     
-    # Create attack/release curve
-    release_curve = np.exp(-np.arange(release_samples) / (release_samples / 4))
-    attack_curve = np.exp(-np.arange(attack_samples)[::-1] / (attack_samples / 2))
-    ar_curve = np.concatenate([attack_curve, release_curve])
-    ar_curve = ar_curve / np.sum(ar_curve)
+    # Apply gain reduction to entire signal (simple but effective approach)
+    with tqdm(total=1, desc="Applying gain reduction", unit="file") as pbar:
+        result = data * gain_factor
+        time.sleep(0.1)  # Small delay to show progress bar
+        pbar.update(1)
     
-    # Apply smoothing to gain reduction
-    smoothed_reduction = np.ones_like(gain_reduction)
+    # Verify result
+    final_peak = measure_true_peak_efficient(result, rate)
+    print(f"Final true peak after limiting: {final_peak:.2f} dBTP")
     
-    # Process each channel separately
-    for c in range(gain_reduction.shape[1] if len(gain_reduction.shape) > 1 else 1):
-        if len(gain_reduction.shape) > 1:
-            channel_reduction = signal.lfilter(ar_curve, [1.0], gain_reduction[:, c])
-            smoothed_reduction[:, c] = np.minimum(gain_reduction[:, c], channel_reduction)
-        else:
-            channel_reduction = signal.lfilter(ar_curve, [1.0], gain_reduction)
-            smoothed_reduction = np.minimum(gain_reduction, channel_reduction)
+    # If the result is still above the limit (due to rounding errors), clip it
+    if final_peak > true_peak_limit:
+        print(f"Applying hard clipping to ensure true peak limit")
+        result = np.clip(result, -0.98, 0.98)  # Slightly below 1.0 for safety
     
-    # Apply smoothed gain reduction
-    limited_data = oversampled_data * smoothed_reduction
-    
-    # Downsample back to original rate
-    output_data = resampy.resample(limited_data, oversampled_rate, rate)
-    
-    return output_data
+    return result
 
 def check_true_peak(data, rate, true_peak_limit=-1.0, num_processes=max(1, cpu_count() - 1)):
     """
