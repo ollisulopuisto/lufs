@@ -62,16 +62,30 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         loudness = meter.integrated_loudness(data)
         print(f"Input integrated loudness: {loudness:.2f} LUFS")
 
-        # Calculate loudness difference
-        loudness_diff = target_lufs - loudness
+        # STEP 1: Check and apply true peak limiting first if needed
+        print(f"Checking true peak limit ({true_peak:.2f} dBTP)...")
+        data_peak_limited = check_true_peak(data, rate, true_peak, num_processes)
+        
+        # STEP 2: Re-measure loudness after true peak limiting
+        loudness_after_peak_limiting = meter.integrated_loudness(data_peak_limited)
+        if abs(loudness - loudness_after_peak_limiting) > 0.1:  # If true peak limiting changed loudness significantly
+            print(f"After true peak limiting: {loudness_after_peak_limiting:.2f} LUFS")
+        
+        # STEP 3: Calculate loudness difference and apply gain
+        loudness_diff = target_lufs - loudness_after_peak_limiting
         print(f"Target: {target_lufs:.2f} LUFS, difference: {loudness_diff:.2f} dB")
         
-        # Apply gain
-        normalized_data = data * (10**(loudness_diff/20))
-
-        # Apply true peak limiting if needed
-        print(f"Checking true peak limit ({true_peak:.2f} dBTP)...")
-        normalized_data = apply_true_peak_limiting(normalized_data, rate, true_peak, num_processes)
+        # Apply gain for LUFS normalization
+        normalized_data = data_peak_limited * (10**(loudness_diff/20))
+        
+        # STEP 4: Final true peak check and limiting if necessary
+        final_true_peak = measure_true_peak(normalized_data, rate)
+        print(f"Final true peak: {final_true_peak:.2f} dBTP")
+        
+        if final_true_peak > true_peak:
+            gain_reduction = true_peak - final_true_peak
+            print(f"Applying final gain reduction of {gain_reduction:.2f} dB to meet true peak limit...")
+            normalized_data = normalized_data * (10**(gain_reduction/20))
         
         # Ensure data stays within [-1, 1] range
         normalized_data = np.clip(normalized_data, -1.0, 1.0)
@@ -87,6 +101,47 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
 
     except Exception as e:
         return f"Error processing {input_file}: {str(e)}"
+
+def check_true_peak(data, rate, true_peak_limit=-1.0, num_processes=max(1, cpu_count() - 1)):
+    """
+    Check if true peak exceeds limit and apply limiting if needed.
+    
+    Args:
+        data (ndarray): Audio data
+        rate (int): Sample rate
+        true_peak_limit (float): Maximum true peak level in dBTP
+        num_processes (int): Number of processes for parallel processing
+    
+    Returns:
+        ndarray: Processed audio data
+    """
+    true_peak_db = measure_true_peak(data, rate)
+    print(f"Original true peak: {true_peak_db:.2f} dBTP")
+    
+    if true_peak_db > true_peak_limit:
+        return apply_true_peak_limiting(data, rate, true_peak_limit, num_processes)
+    else:
+        return data
+
+def measure_true_peak(data, rate):
+    """
+    Measure the true peak level of audio data.
+    
+    Args:
+        data (ndarray): Audio data
+        rate (int): Sample rate
+    
+    Returns:
+        float: True peak level in dBTP
+    """
+    # Upsample for true peak measurement (4x oversampling)
+    oversampled_data = resampy.resample(data, rate, rate * 4)
+    
+    # Find the maximum peak
+    true_peak = np.max(np.abs(oversampled_data))
+    true_peak_db = 20 * np.log10(true_peak) if true_peak > 0 else -120.0
+    
+    return true_peak_db
 
 def apply_true_peak_limiting(data, rate, true_peak_limit=-1.0, num_processes=max(1, cpu_count() - 1)):
     """
