@@ -64,6 +64,18 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         print(f"Input integrated loudness: {loudness:.2f} LUFS")
         print(f"Input true peak: {initial_true_peak:.2f} dBTP")
         
+        # IMPORTANT CHANGE: First apply brickwall limiting if the true peak is already over limit
+        # This preserves the average loudness while bringing peaks under control
+        if initial_true_peak > true_peak:
+            print(f"Input true peak {initial_true_peak:.2f} dBTP exceeds limit of {true_peak:.2f} dBTP")
+            print(f"Applying brickwall limiting before normalization...")
+            data = apply_brickwall_limiter(data, rate, true_peak, 0.050, num_processes)
+            
+            # Re-measure after brickwall limiting
+            loudness = meter.integrated_loudness(data)
+            initial_true_peak = measure_true_peak(data, rate)
+            print(f"After brickwall limiting: loudness {loudness:.2f} LUFS, true peak {initial_true_peak:.2f} dBTP")
+        
         # Calculate the maximum gain we can apply while respecting the true peak limit
         headroom = true_peak - initial_true_peak
         loudness_diff = target_lufs - loudness
