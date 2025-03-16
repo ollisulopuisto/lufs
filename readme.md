@@ -27,7 +27,9 @@ git clone https://github.com/ollisulopuisto/lufs.git cd lufs
 2. (Optional but recommended) Create a virtual environment:
 
 ```
-python3 -m venv .venv source .venv/bin/activate # On Windows: .venv\Scripts\activate3
+python3 -m venv .venv 
+source .venv/bin/activate 
+# On Windows: .venv\Scripts\activate3
 ```
 
 3. Install dependencies:
@@ -61,8 +63,14 @@ parallel_normalize_audio(input_files, output_files)
 
 ## Command Line Usage
 
-```
-python lufs.py
+While the script is designed to be used as a module, you can also invoke it directly from the command line. To do this, you'll need to specify the input and output files as arguments.
+
+**Example:**
+
+To normalize `input.wav` to `-16 LUFS` and save it as `output.wav`, you would run:
+
+```bash
+python lufs.py input.wav output.wav -t -16.0 -p -1.0
 ```
 
 ## Parameters

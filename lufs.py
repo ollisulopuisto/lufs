@@ -2,21 +2,23 @@ import pyloudnorm as pyln
 import soundfile as sf
 import numpy as np
 import os
-from multiprocessing import Pool, cpu_count
+import resampy
+from multiprocessing import Pool, cpu_count, freeze_support
 import subprocess
+import argparse
 
 def install_dependencies():
     """
     Installs the required dependencies if they are not already installed.
-    If pip install fails, suggests creating a virtual environment.
     """
     try:
         import pyloudnorm
         import soundfile
+        import resampy
     except ImportError:
         print("Installing dependencies...")
         try:
-            subprocess.check_call(["pip", "install", "pyloudnorm", "soundfile"])
+            subprocess.check_call(["pip", "install", "pyloudnorm", "soundfile", "resampy", "numpy"])
             print("Dependencies installed.")
         except subprocess.CalledProcessError as e:
             print(f"Error installing dependencies: {e}")
@@ -48,6 +50,11 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         data, rate = sf.read(input_file)
         print("Audio data loaded.")
 
+        # Get the subtype from the input file
+        with sf.SoundFile(input_file, 'r') as f:
+            subtype = f.subtype
+        print(f"Original subtype: {subtype}")
+
         # Initialize meter
         print("Initializing loudness meter...")
         meter = pyln.Meter(rate)
@@ -61,7 +68,7 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         # Skip normalization if input is too quiet
         if loudness <= -70.0:  # Threshold for "too quiet"
             print("Input audio is too quiet for meaningful normalization.")
-            sf.write(output_file, data, rate)
+            sf.write(output_file, data, rate, subtype=subtype)
             return
 
         # Calculate loudness difference
@@ -94,16 +101,18 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
 
         # Write output audio
         print(f"Writing normalized audio to {output_file}...")
-        sf.write(output_file, normalized_data, rate)
+        sf.write(output_file, normalized_data, rate, subtype=subtype)
         print(f"Audio normalized and saved to {output_file}")
 
     except Exception as e:
         print(f"An error occurred: {e}")
 
 def apply_true_peak_limiting(data, rate, true_peak_limit=-1.0):
-    """Apply true peak limiting to audio data."""
-    # Upsample for true peak measurement (typically 4x)
+    """Apply true peak limiting to audio data with progress bar."""
     import resampy
+    from tqdm import tqdm
+    
+    # Upsample for true peak measurement (typically 4x)
     oversampled_data = resampy.resample(data, rate, rate * 4)
     
     # Find the maximum peak
@@ -113,7 +122,10 @@ def apply_true_peak_limiting(data, rate, true_peak_limit=-1.0):
     # Apply gain reduction if needed
     if true_peak_db > true_peak_limit:
         gain_reduction = true_peak_limit - true_peak_db
-        data = data * (10**(gain_reduction/20))
+        
+        # Apply gain reduction with progress bar
+        for i in tqdm(range(len(data)), desc="Applying gain reduction"):
+            data[i] = data[i] * (10**(gain_reduction/20))
     
     return data
 
@@ -163,18 +175,28 @@ def process_wrapper(args):
         print(f"Process {process_id}: Finished normalizing {input_file} to {output_file}")
     return f"Process {process_id}: Completed its tasks."
 
-# Example usage
-input_audio_files = ["input1.wav", "input2.wav"]  # Replace with the paths to your input audio files.
-output_audio_files = ["output1.wav", "output2.wav"]  # Replace with the desired paths for the output files
+# Create test file with a sine wave
+def create_test_file(file_path, duration=5, sample_rate=44100):
+    """Create a test audio file with a 440 Hz sine wave"""
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    data = 0.5 * np.sin(2 * np.pi * 440 * t)  # 440 Hz sine wave at -6 dBFS
+    data = data.reshape(-1, 1)  # Convert to mono format
+    sf.write(file_path, data, sample_rate)
+    print(f"Created test audio file: {file_path}")
 
-# Create dummy audio files for testing
-for file in input_audio_files:
-    if not os.path.exists(file):
-        # Create a silent audio file
-        rate = 44100  # Sample rate
-        duration = 5  # Duration in seconds
-        data = np.zeros((rate * duration, 1), dtype=np.float32)  # Create silent data
-        sf.write(file, data, rate)
-        print(f"Created dummy audio file: {file}")
+def main():
+    parser = argparse.ArgumentParser(description="Normalize audio files to a target LUFS level.")
+    parser.add_argument("input_file", help="Path to the input audio file.")
+    parser.add_argument("output_file", help="Path to the output audio file.")
+    parser.add_argument("-t", "--target_lufs", type=float, default=-16.0, help="Target LUFS level (default: -16.0).")
+    parser.add_argument("-p", "--true_peak", type=float, default=-1.0, help="Maximum true peak level (default: -1.0).")
+    parser.add_argument("-l", "--lra_max", type=float, default=9.0, help="Maximum loudness range (default: 9.0).")
 
-parallel_normalize_audio(input_audio_files, output_audio_files)
+    args = parser.parse_args()
+
+    normalize_audio(args.input_file, args.output_file, args.target_lufs, args.true_peak, args.lra_max)
+
+if __name__ == "__main__":
+    freeze_support()
+    install_dependencies()
+    main()

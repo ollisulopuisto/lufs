@@ -1,0 +1,9 @@
+# Core dependencies for LUFS Audio Normalizer
+pyloudnorm>=0.1.0
+soundfile>=0.10.3
+numpy>=1.19.0
+resampy>=0.2.2
+
+# Optional dependencies that may be useful
+matplotlib>=3.3.0  # For visualization if needed
+tqdm>=4.50.0  # For progress bars
