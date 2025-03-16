@@ -78,20 +78,26 @@ python lufs.py -b input1.wav input2.wav output1.wav output2.wav -t -16.0 -p -1.0
 
 ## Command Line Options
 
+
 File Options:
+```
   input_file            Input audio file path
   output_file           Output audio file path
   -b, --batch           Process multiple files (provide space-separated input files followed by output files)
-
+```
 Normalization Settings:
+```
   -t, --target_lufs     Target LUFS level (default: -16.0)
   -p, --true_peak       Maximum true peak level (default: -1.0)
   -l, --lra_max         Maximum loudness range (default: 9.0)
+```  
 
 Performance Options:
+```
   -n, --num_processes   Number of processes to use (default: CPU count - 1)
   -c, --chunk_size      Size of processing chunks in seconds (default: 5.0)
   --no-cache            Disable caching of loudness analysis results
+```  
 
 ## Using as a Module
 
