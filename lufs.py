@@ -336,130 +336,148 @@ def apply_gain_reduction_chunk(args):
 
 def apply_brickwall_limiter(data, rate, true_peak_limit=-1.0, release_time=0.050, num_processes=max(1, cpu_count() - 1)):
     """
-    Apply a brickwall limiter that only affects peaks exceeding the threshold.
-    More efficient implementation with progress bars.
+    Apply a brickwall limiter with CPU-intensive optimization and reduced memory usage.
     """
     from scipy import signal
-    import numpy as np
     from tqdm import tqdm
+    import gc  # For garbage collection
     
     print("Starting brickwall limiting process...")
     
-    # Use 2x oversampling instead of 4x for better performance
-    oversampling_factor = 2
-    oversampled_rate = rate * oversampling_factor
+    # Convert threshold to linear once
+    threshold_linear = 10 ** (true_peak_limit / 20.0)
     
-    # Process in chunks for large files
-    if len(data) > 1000000:  # For files larger than ~1M samples
-        print(f"Large file detected ({len(data)} samples), processing in chunks...")
-        chunk_size = 500000
-        result_chunks = []
-        
-        # Convert threshold to linear
-        threshold_linear = 10 ** (true_peak_limit / 20.0)
-        
-        # Process each chunk with overlap
-        overlap = int(rate * 0.1)  # 100ms overlap
-        
-        # Add some padding to beginning and end for filter edges
-        padded_data = np.pad(data, ((overlap, overlap), (0, 0)) if len(data.shape) > 1 else (overlap, overlap), 'edge')
-        
-        total_chunks = (len(padded_data) + chunk_size - 1) // chunk_size
-        for i in tqdm(range(0, len(padded_data), chunk_size), desc="Processing chunks", total=total_chunks):
-            end_idx = min(i + chunk_size + overlap, len(padded_data))
-            chunk = padded_data[i:end_idx]
-            
-            # Process this chunk
-            # Step 1: Upsample
-            oversampled_chunk = resampy.resample(chunk, rate, oversampled_rate)
-            
-            # Step 2: Calculate gain reduction
-            abs_data = np.abs(oversampled_chunk)
-            gain_reduction = np.ones_like(abs_data)
-            mask = abs_data > threshold_linear
-            gain_reduction[mask] = threshold_linear / abs_data[mask]
-            
-            # Step 3: Apply smoothing filter to gain reduction
-            release_samples = int(release_time * oversampled_rate)
-            if release_samples > 0 and np.any(mask):
-                release_curve = np.exp(-np.arange(release_samples) / (release_samples / 5))
-                release_curve = release_curve / np.sum(release_curve)
-                
-                if len(gain_reduction.shape) > 1:  # Multi-channel
-                    for c in range(gain_reduction.shape[1]):
-                        gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[:, c][::-1])[::-1]
-                        gain_reduction[:, c] = np.minimum(gain_reduction[:, c], gain_reduction_smooth)
-                else:  # Mono
-                    gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[::-1])[::-1]
-                    gain_reduction = np.minimum(gain_reduction, gain_reduction_smooth)
-            
-            # Step 4: Apply gain reduction
-            limited_chunk = oversampled_chunk * gain_reduction
-            
-            # Step 5: Downsample
-            result_chunk = resampy.resample(limited_chunk, oversampled_rate, rate)
-            
-            # Remove overlap padding from result, except at the edges of the file
-            start_trim = 0 if i == 0 else overlap
-            end_trim = 0 if end_idx >= len(padded_data) else overlap
-            trimmed_result = result_chunk[start_trim:len(result_chunk)-end_trim]
-            
-            result_chunks.append(trimmed_result)
-        
-        # Concatenate all processed chunks
-        result = np.concatenate(result_chunks)
-        print("Finished processing all chunks")
-        
-    else:  # For smaller files, process all at once
-        print("Processing audio in one pass...")
-        
-        # Convert threshold to linear
-        threshold_linear = 10 ** (true_peak_limit / 20.0)
-        
-        # Step 1: Upsample (with progress indicator)
-        print("Upsampling audio...")
-        oversampled_data = resampy.resample(data, rate, oversampled_rate)
-        
-        # Step 2: Calculate gain reduction
-        print("Calculating gain reduction...")
-        abs_data = np.abs(oversampled_data)
-        gain_reduction = np.ones_like(abs_data)
-        mask = abs_data > threshold_linear
-        
-        if not np.any(mask):
-            print("No samples exceed threshold, no limiting needed")
-            return data
-            
-        gain_reduction[mask] = threshold_linear / abs_data[mask]
-        
-        # Step 3: Apply smoothing filter
-        print("Applying smoothing to gain reduction curve...")
-        release_samples = int(release_time * oversampled_rate)
-        if release_samples > 0:
-            release_curve = np.exp(-np.arange(release_samples) / (release_samples / 5))
-            release_curve = release_curve / np.sum(release_curve)
-            
-            if len(gain_reduction.shape) > 1:  # Multi-channel
-                for c in range(gain_reduction.shape[1]):
-                    gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[:, c][::-1])[::-1]
-                    gain_reduction[:, c] = np.minimum(gain_reduction[:, c], gain_reduction_smooth)
-            else:  # Mono
-                gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[::-1])[::-1]
-                gain_reduction = np.minimum(gain_reduction, gain_reduction_smooth)
-        
-        # Step 4: Apply gain reduction
-        print("Applying limiting...")
-        limited_data = oversampled_data * gain_reduction
-        
-        # Step 5: Downsample
-        print("Downsampling to original rate...")
-        result = resampy.resample(limited_data, oversampled_rate, rate)
+    # Create release curve once
+    release_samples = int(release_time * rate)
+    release_curve = np.exp(-np.arange(release_samples) / (release_samples / 5))
+    release_curve = release_curve / np.sum(release_curve)
     
-    # Final verification
-    final_peak = measure_true_peak_efficient(result, rate)
-    print(f"After limiting: true peak = {final_peak:.2f} dBTP")
+    # Determine if we're working with mono or stereo
+    is_multichannel = len(data.shape) > 1
+    num_channels = data.shape[1] if is_multichannel else 1
+    
+    # Choose a better chunk size - smaller for better parallelism
+    chunk_size = 100000  # Reduced from 500000 
+    
+    # Process each channel separately for more CPU parallelism
+    if is_multichannel:
+        result = np.zeros_like(data)
+        channel_data = []
+        
+        # Split channels for parallel processing
+        for c in range(num_channels):
+            channel_data.append(data[:, c])
+        
+        # Process each channel in parallel
+        with Pool(processes=num_processes) as pool:
+            result_channels = list(tqdm(
+                pool.starmap(process_audio_channel, 
+                            [(channel, rate, threshold_linear, release_curve, chunk_size) for channel in channel_data]),
+                total=num_channels,
+                desc="Processing channels"
+            ))
+        
+        # Recombine channels
+        for c in range(num_channels):
+            result[:, c] = result_channels[c]
+            
+        # Help garbage collection 
+        del result_channels
+        gc.collect()
+            
+    else:  # Mono processing - use chunks in parallel
+        num_chunks = max(1, len(data) // chunk_size)
+        chunks = []
+        
+        # Create chunks with overlap
+        overlap = release_samples * 2
+        for i in range(0, len(data), chunk_size):
+            end = min(i + chunk_size, len(data))
+            # Add some context before and after the chunk for proper limiting
+            start_with_context = max(0, i - overlap)
+            end_with_context = min(end + overlap, len(data))
+            
+            chunk_info = {
+                'start': i,
+                'end': end,
+                'data': data[start_with_context:end_with_context],
+                'context_start': start_with_context,
+                'offset': i - start_with_context
+            }
+            chunks.append(chunk_info)
+            
+        # Process chunks in parallel
+        with Pool(processes=num_processes) as pool:
+            processed_chunks = list(tqdm(
+                pool.starmap(process_audio_chunk, 
+                            [(chunk, rate, threshold_linear, release_curve) for chunk in chunks]),
+                total=len(chunks),
+                desc="Processing chunks"
+            ))
+            
+        # Reassemble the audio
+        result = np.zeros_like(data)
+        for i, processed in enumerate(processed_chunks):
+            chunk_info = chunks[i]
+            start = chunk_info['start']
+            end = chunk_info['end']
+            offset = chunk_info['offset']
+            
+            # Place the processed audio in the correct position
+            result[start:end] = processed[offset:offset + (end - start)]
+            
+        # Help garbage collection
+        del chunks
+        del processed_chunks
+        gc.collect()
     
     return result
+
+def process_audio_channel(channel_data, rate, threshold_linear, release_curve, chunk_size):
+    """Process a single audio channel in chunks to reduce memory usage"""
+    result = np.zeros_like(channel_data)
+    
+    for i in range(0, len(channel_data), chunk_size):
+        end = min(i + chunk_size, len(channel_data))
+        
+        # Process this chunk
+        chunk = channel_data[i:end]
+        
+        # Calculate gain reduction for this chunk
+        abs_data = np.abs(chunk)
+        gain_reduction = np.ones_like(abs_data)
+        mask = abs_data > threshold_linear
+        if np.any(mask):
+            gain_reduction[mask] = threshold_linear / abs_data[mask]
+            
+            # Apply smoothing with CPU-intensive operation
+            gain_reduction = signal.lfilter(release_curve, [1.0], gain_reduction[::-1])[::-1]
+        
+        # Apply gain reduction (uses CPU for math)
+        result[i:end] = chunk * gain_reduction
+        
+    return result
+
+def process_audio_chunk(chunk_info, rate, threshold_linear, release_curve):
+    """Process a chunk of audio with its context and return the limited result"""
+    chunk_data = chunk_info['data']
+    
+    # Calculate gain reduction
+    abs_data = np.abs(chunk_data)
+    gain_reduction = np.ones_like(abs_data)
+    mask = abs_data > threshold_linear
+    
+    if np.any(mask):
+        # Apply CPU-intensive operations
+        gain_reduction[mask] = threshold_linear / abs_data[mask]
+        
+        # Smooth the gain reduction curve
+        gain_reduction = signal.lfilter(release_curve, [1.0], gain_reduction[::-1])[::-1]
+        
+    # Apply the gain reduction
+    limited_data = chunk_data * gain_reduction
+    
+    return limited_data
 
 def parallel_normalize_audio(input_files, output_files, target_lufs=-16.0, true_peak=-1.0, lra_max=9.0, num_processes=None):
     """
