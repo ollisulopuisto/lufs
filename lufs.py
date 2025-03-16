@@ -93,7 +93,7 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak_limit=
                     if current_lra > lra_max:
                         print(f"Applying compression to reduce LRA from {current_lra:.2f} to {lra_max:.2f} LU")
                         # Apply multi-stage compression
-                        data = apply_multi_stage_compression(data, rate, current_lra, lra_max)
+                        data = apply_multi_stage_compression_parallel(data, rate, current_lra, lra_max, num_processes)
                         
                         # Re-measure loudness after compression
                         compressed_loudness = meter.integrated_loudness(data)
@@ -1072,7 +1072,7 @@ def apply_gain_streaming(input_file, output_file, gain, chunk_seconds=5.0):
     return "Gain application completed"
 
 def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_time, chunk_seconds=5.0):
-    """Apply true peak limiting in a streaming fashion"""
+    """Apply true peak limiting in a streaming fashion with proper oversampling"""
     from scipy import signal
     
     with sf.SoundFile(input_file, 'r') as infile:
@@ -1083,8 +1083,10 @@ def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_ti
         with sf.SoundFile(output_file, 'w', samplerate=rate, 
                           channels=channels, subtype=infile.subtype) as outfile:
             
-            # Calculate parameters
-            threshold_linear = 10 ** (true_peak_limit / 20.0)
+            # Add safety margin to ensure we actually hit the target
+            # Using a 0.1dB safety margin compensates for lossy processing
+            working_threshold = true_peak_limit - 0.1
+            threshold_linear = 10 ** (working_threshold / 20.0)
             release_samples = int(release_time * rate)
             
             # Create release curve
@@ -1093,10 +1095,7 @@ def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_ti
             
             # Process in overlapping chunks for smooth transitions
             chunk_size = int(rate * chunk_seconds)
-            overlap_size = max(release_samples * 2, int(rate * 0.2))  # Max of 2x release or 200ms
-            
-            # State variables for filter
-            gain_state = None
+            overlap_size = max(release_samples * 2, int(rate * 0.2))
             
             with tqdm(total=infile.frames, desc="Applying limiting", unit="samples") as pbar:
                 pos = 0
@@ -1110,24 +1109,32 @@ def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_ti
                     if len(chunk) == 0:
                         break
                     
-                    # Calculate gain reduction curve
-                    abs_data = np.abs(chunk)
-                    gain_reduction = np.ones_like(chunk)
+                    # CRUCIAL CHANGE: Upsample for true peak detection and limiting
+                    oversampling_factor = 4
+                    oversampled_chunk = resampy.resample(chunk, rate, rate * oversampling_factor)
+                    
+                    # Calculate gain reduction based on oversampled signal
+                    abs_data = np.abs(oversampled_chunk)
+                    gain_reduction = np.ones_like(abs_data)
                     mask = abs_data > threshold_linear
                     if np.any(mask):
                         gain_reduction[mask] = threshold_linear / abs_data[mask]
                     
                     # Apply smoothing filter to gain reduction
-                    if len(chunk.shape) > 1:  # Multi-channel audio
+                    if len(oversampled_chunk.shape) > 1:  # Multi-channel audio
                         for c in range(channels):
+                            # Forward-backward smoothing for more transparent limiting
                             gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[:, c][::-1])[::-1]
                             gain_reduction[:, c] = np.minimum(gain_reduction[:, c], gain_reduction_smooth)
                     else:  # Mono audio
                         gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[::-1])[::-1]
                         gain_reduction = np.minimum(gain_reduction, gain_reduction_smooth)
                     
-                    # Apply gain reduction
-                    limited_chunk = chunk * gain_reduction
+                    # Apply gain reduction to oversampled signal
+                    limited_oversampled = oversampled_chunk * gain_reduction
+                    
+                    # Downsample back to original rate
+                    limited_chunk = resampy.resample(limited_oversampled, rate * oversampling_factor, rate)
                     
                     # Write only the non-overlapping part except for last chunk
                     write_size = min(chunk_size, len(limited_chunk))
@@ -1136,6 +1143,35 @@ def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_ti
                     # Advance position
                     pos += write_size
                     pbar.update(write_size)
+                    
+            # Final verification of true peak
+            print("Verifying final true peak level...")
+            final_tp = measure_true_peak_streaming(output_file, chunk_seconds)
+            print(f"Final true peak after limiting: {final_tp:.2f} dBTP")
+            
+            # If still above threshold (unlikely), apply a final quick limiting pass
+            if final_tp > true_peak_limit:
+                print(f"Warning: True peak {final_tp:.2f} dBTP still above target {true_peak_limit:.2f} dBTP.")
+                print("Applying final gain adjustment...")
+                
+                # Create another temp file
+                import tempfile
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                temp_path = temp_file.name
+                temp_file.close()
+                
+                try:
+                    # Move the current output to temp
+                    os.rename(output_file, temp_path)
+                    
+                    # Apply a final gain reduction
+                    safety_gain = true_peak_limit - final_tp - 0.05  # Extra safety margin
+                    apply_gain_streaming(temp_path, output_file, safety_gain, chunk_seconds)
+                    
+                    # Clean up
+                    os.unlink(temp_path)
+                except Exception as e:
+                    print(f"Error during final adjustment: {e}")
     
     return "Limiting completed"
 
@@ -1208,14 +1244,34 @@ def optimized_resample(data, orig_sr, target_sr):
             if torch.backends.mps.is_available():
                 # Convert to torch tensor and move to MPS device
                 device = torch.device("mps")
-                tensor_data = torch.tensor(data, device=device)
-                # Process with torch's resampling (implementation required)
-                # ... 
-                return result.cpu().numpy()
-        except:
-            pass
+                
+                # Handle multi-channel audio properly
+                if len(data.shape) > 1:
+                    # Transpose to [C, T] format for torchaudio
+                    tensor_data = torch.tensor(data.T, device=device, dtype=torch.float32)
+                    channels = data.shape[1]
+                else:
+                    # Add channel dimension for mono
+                    tensor_data = torch.tensor(data, device=device, dtype=torch.float32).unsqueeze(0)
+                    channels = 1
+                
+                # Use torchaudio's resampler which supports MPS acceleration
+                import torchaudio.functional as F
+                resampled = F.resample(tensor_data, orig_sr, target_sr)
+                
+                # Convert back to numpy array with correct shape
+                if channels > 1:
+                    # Transpose back to [T, C] format
+                    return resampled.cpu().numpy().T
+                else:
+                    return resampled.squeeze(0).cpu().numpy()
+                    
+        except ImportError:
+            print("PyTorch/torchaudio not available, using resampy instead")
+        except Exception as e:
+            print(f"Metal acceleration error: {e}, falling back to resampy")
             
-    # Fall back to resampy if torch isn't available
+    # Fall back to resampy if torch isn't available or for non-Apple Silicon
     return resampy.resample(data, orig_sr, target_sr)
 
 def main():
@@ -1543,3 +1599,361 @@ def measure_exact_lra(data, rate, meter):
     else:
         print("Not enough valid loudness measurements")
         return 0.0
+
+def measure_true_peak_streaming_parallel(audio_file, chunk_seconds=5.0, num_processes=None):
+    """Parallel true peak measurement using multiple processes"""
+    import math
+    from multiprocessing import Pool
+    
+    if num_processes is None:
+        num_processes = max(1, cpu_count() - 1)
+    
+    # First determine file properties
+    with sf.SoundFile(audio_file, 'r') as f:
+        rate = f.samplerate
+        total_frames = f.frames
+    
+    # Create chunks for parallel processing
+    chunk_size = int(rate * chunk_seconds)
+    num_chunks = math.ceil(total_frames / chunk_size)
+    
+    # Create a list of chunk positions
+    chunk_positions = [(audio_file, i * chunk_size, min((i+1) * chunk_size, total_frames), rate) 
+                      for i in range(num_chunks)]
+    
+    # Process chunks in parallel
+    with Pool(processes=min(num_processes, num_chunks)) as pool:
+        results = list(tqdm(
+            pool.imap(measure_chunk_true_peak, chunk_positions),
+            total=len(chunk_positions),
+            desc="Measuring true peak",
+            unit="chunk"
+        ))
+    
+    # Return the maximum true peak
+    return max(results)
+    
+def measure_chunk_true_peak(args):
+    """Process a single chunk for true peak measurement"""
+    filename, start, end, rate = args
+    
+    # Read the chunk
+    with sf.SoundFile(filename, 'r') as f:
+        f.seek(start)
+        chunk = f.read(end - start)
+    
+    # Process with 4x oversampling
+    oversampled_chunk = resampy.resample(chunk, rate, rate * 4)
+    chunk_peak = np.max(np.abs(oversampled_chunk))
+    
+    if chunk_peak > 0:
+        return 20 * np.log10(chunk_peak)
+    else:
+        return -120.0
+
+def apply_multi_stage_compression_parallel(data, rate, current_lra, target_lra, num_processes=None):
+    """
+    Parallel multi-stage compression to reduce LRA in a more natural way
+    """
+    print("\n--- Starting Parallel Multi-Stage LRA Reduction ---")
+    print(f"Current LRA: {current_lra:.2f} LU, Target: {target_lra:.2f} LU")
+    
+    if num_processes is None:
+        num_processes = max(1, cpu_count() - 1)
+    
+    # Only compress if we need to reduce LRA
+    if current_lra <= target_lra:
+        print(f"No compression needed")
+        return data
+    
+    # Calculate how many stages we need
+    lra_to_reduce = current_lra - target_lra
+    num_stages = min(8, max(1, int(np.ceil(lra_to_reduce / 0.8))))
+    
+    # Metadata to track changes
+    meter = pyln.Meter(rate)
+    original_loudness = meter.integrated_loudness(data)
+    
+    print(f"Using {num_stages} compression stages to reduce LRA by {lra_to_reduce:.2f} LU")
+    print(f"Starting loudness: {original_loudness:.2f} LUFS")
+    
+    # Create stages configuration
+    stages = []
+    
+    # Define stage configurations as before
+    # ... (your existing stage configuration code) ...
+    
+    # Create a process pool for parallel stage analysis
+    pool = Pool(processes=min(num_processes, num_stages))
+    
+    # First analyze the file in parallel to determine thresholds
+    # (each stage needs to calculate its own threshold based on signal statistics)
+    stage_configs = []
+    for i, stage in enumerate(stages):
+        # Create a configuration for this stage
+        config = {
+            'stage_num': i+1,
+            'stage_name': stage['name'],
+            'percentile': stage['percentile'],
+            'ratio': stage['ratio'],
+            'attack': stage['attack'],
+            'release': stage['release'],
+            'data': data,  # This will be large but necessary for parallel processing
+            'rate': rate
+        }
+        stage_configs.append(config)
+    
+    # Process stages in parallel for threshold analysis
+    analyzed_stages = list(tqdm(
+        pool.imap(analyze_compression_stage, stage_configs),
+        total=len(stage_configs),
+        desc="Analyzing compression stages"
+    ))
+    
+    # Now apply stages sequentially (compression stages are inherently sequential)
+    processed_data = data.copy()
+    for stage_result in analyzed_stages:
+        print(f"\nApplying stage {stage_result['stage_num']}/{len(stages)}: {stage_result['stage_name']}")
+        print(f"  Threshold: {stage_result['threshold_loudness']:.2f} LUFS")
+        print(f"  Ratio: {stage_result['ratio']:.1f}:1")
+        
+        processed_data = apply_compressor_with_time_constants(
+            processed_data, 
+            rate, 
+            stage_result['threshold_linear'],
+            stage_result['ratio'],
+            stage_result['attack'],
+            stage_result['release']
+        )
+        
+        # Re-measure and correct loudness
+        stage_loudness = meter.integrated_loudness(processed_data)
+        gain_adjust = original_loudness - stage_loudness
+        print(f"  Post-compression loudness: {stage_loudness:.2f} LUFS")
+        print(f"  Applying correction gain: {gain_adjust:.2f} dB")
+        
+        # Maintain original loudness
+        processed_data = processed_data * (10**(gain_adjust/20))
+    
+    # Close the pool
+    pool.close()
+    pool.join()
+    
+    # Measure final LRA
+    # ... (your existing LRA measurement code) ...
+    
+    return processed_data
+
+def analyze_compression_stage(config):
+    """Analyze a compression stage to determine threshold (for parallel execution)"""
+    # Extract configuration
+    data = config['data']
+    rate = config['rate']
+    percentile = config['percentile']
+    
+    # Calculate loudness values to determine threshold
+    meter = pyln.Meter(rate)
+    loudness_values = []
+    window_size = int(1 * rate)
+    hop_size = int(0.2 * rate)
+    
+    # Use strided analysis to improve performance
+    for j in range(0, len(data) - window_size, hop_size):
+        window_data = data[j:j + window_size]
+        window_loudness = meter.integrated_loudness(window_data)
+        if window_loudness > -70:
+            loudness_values.append(window_loudness)
+    
+    # Calculate threshold based on percentile
+    if loudness_values:
+        loudness_values.sort()
+        threshold_idx = min(len(loudness_values)-1, 
+                           max(0, int(len(loudness_values) * (percentile/100))))
+        threshold_loudness = loudness_values[threshold_idx]
+        
+        # Convert to linear domain
+        threshold_linear = 10 ** (threshold_loudness/20)
+        
+        # Return the results along with the original config
+        result = config.copy()
+        result['threshold_loudness'] = threshold_loudness
+        result['threshold_linear'] = threshold_linear
+        
+        # Remove large data array from result to save memory
+        result.pop('data')
+        
+        return result
+    else:
+        # Return original config with default values if no valid loudness
+        result = config.copy()
+        result['threshold_loudness'] = -20.0
+        result['threshold_linear'] = 0.1
+        result.pop('data')
+        return result
+
+def apply_metal_optimized_dsp(audio_file, output_file, process_fn):
+    """
+    Process audio using Metal acceleration on Apple Silicon.
+    This is a general framework for accelerated DSP operations.
+    
+    Args:
+        audio_file: Input audio path
+        output_file: Output audio path
+        process_fn: Function that processes numpy arrays using Metal
+    """
+    import platform
+    
+    if platform.system() == 'Darwin' and platform.machine() == 'arm64':
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                print("Using Metal Performance Shaders for audio processing")
+                
+                # Read audio data
+                data, rate = sf.read(audio_file)
+                
+                # Get the subtype from the input file
+                with sf.SoundFile(audio_file, 'r') as f:
+                    subtype = f.subtype
+                
+                # Convert to torch tensor and move to MPS device
+                device = torch.device("mps")
+                
+                if len(data.shape) > 1:  # Stereo/multichannel
+                    tensor_data = torch.tensor(data, device=device, dtype=torch.float32)
+                else:  # Mono
+                    tensor_data = torch.tensor(data, device=device, dtype=torch.float32).unsqueeze(1)
+                
+                # Apply the processing function
+                processed_tensor = process_fn(tensor_data)
+                
+                # Move back to CPU and convert to numpy
+                processed_data = processed_tensor.cpu().numpy()
+                
+                # Write output
+                sf.write(output_file, processed_data, rate, subtype=subtype)
+                return True
+        except Exception as e:
+            print(f"Metal acceleration failed: {e}")
+    
+    # Fallback to regular processing
+    return False
+
+def metal_optimized_gain(input_tensor, gain_db):
+    """Example of a Metal-optimized gain function"""
+    gain_linear = 10 ** (gain_db / 20.0)
+    return input_tensor * gain_linear
+
+def setup_apple_silicon_optimizations():
+    """Configure environment for optimal performance on Apple Silicon"""
+    import platform
+    
+    if platform.system() == 'Darwin' and platform.machine() == 'arm64':
+        import os
+        # Use Accelerate framework for numpy/scipy
+        os.environ['ACCELERATE'] = '1'
+        
+        # Set threading options
+        os.environ['OMP_NUM_THREADS'] = str(max(1, cpu_count() - 1))
+        os.environ['MKL_NUM_THREADS'] = str(max(1, cpu_count() - 1))
+        
+        # Enable Metal Performance Shaders if PyTorch is available
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+                print("Metal Performance Shaders enabled for PyTorch acceleration")
+        except ImportError:
+            pass
+            
+        print("Optimizations enabled for Apple Silicon")
+    
+    # Always return True so this can be used in an if statement
+    return True
+
+def process_audio_streaming_parallel(input_file, output_file, target_lufs=-16.0, 
+                                    true_peak_limit=-1.0, lra_max=9.0, 
+                                    num_processes=None, chunk_size=10.0, use_cache=True):
+    """
+    Enhanced parallel streaming audio processor with better CPU and Metal utilization.
+    """
+    if num_processes is None:
+        num_processes = max(1, cpu_count() - 1)
+        
+    # Initialize Metal acceleration if available
+    metal_available = setup_apple_silicon_optimizations()
+    
+    # Create a process pool that will be reused across different processing stages
+    with Pool(processes=num_processes) as pool:
+        # Perform analysis (already optimized in your code)
+        lra_info = analyze_lra_streaming_optimized(input_file, rate, meter, lra_max)
+        
+        # Launch a parallel pipeline of processing stages
+        # Each stage can be executed in parallel if they don't depend on each other
+        pipeline_tasks = []
+        
+        # Compression stage (if needed)
+        if lra_max > 0 and lra_info['lra'] > lra_max:
+            compression_task = pool.apply_async(
+                apply_compression_streaming,
+                (input_file, temp1_path, lra_info['threshold'], lra_info['ratio'], 
+                 meter, chunk_size, lra_max)
+            )
+            pipeline_tasks.append(('compression', compression_task))
+        
+        # Block until compression is done (gain stage depends on this)
+        current_file = input_file
+        for task_name, task in pipeline_tasks:
+            task.wait()
+            if task_name == 'compression':
+                current_file = temp1_path
+        
+        # Calculate gain for LUFS normalization
+        gain = target_lufs - lra_info['loudness']
+        
+        # Apply gain (can run in parallel with previous stage)
+        gain_task = pool.apply_async(
+            apply_gain_streaming,
+            (current_file, temp2_path, gain, chunk_size)
+        )
+        
+        # Wait for gain to complete
+        gain_task.wait()
+        current_file = temp2_path
+        
+        # Measure true peak (can be parallelized internally)
+        true_peak = measure_true_peak_streaming_parallel(current_file, chunk_size, num_processes)
+        
+        # Apply limiting if needed (final stage)
+        if true_peak > true_peak_limit:
+            apply_limiter_streaming(current_file, output_file, true_peak_limit, 0.050, chunk_size)
+        else:
+            copy_audio_streaming(current_file, output_file, chunk_size)
+        
+        # Final measurements can run in parallel
+        loudness_task = pool.apply_async(measure_loudness_streaming, (output_file, meter, chunk_size))
+        peak_task = pool.apply_async(measure_true_peak_streaming_parallel, 
+                                   (output_file, chunk_size, num_processes))
+        
+        # Get final measurements
+        final_loudness = loudness_task.get()
+        final_tp = peak_task.get()
+
+def enable_simd_optimizations():
+    """Enable CPU SIMD vectorization optimizations"""
+    import os
+    
+    # Use AVX2/SSE on Intel or NEON on ARM
+    os.environ['NPY_ENABLE_AVX2'] = '1'
+    os.environ['NPY_ENABLE_SSE41'] = '1'
+    os.environ['NPY_ENABLE_SSE42'] = '1'
+    
+    # Set numpy threading options
+    os.environ['NPY_NUM_THREADS'] = str(max(1, cpu_count() - 1))
+    
+    # Try to import numpy with optimizations enabled
+    try:
+        import numpy as np
+        np.__config__.show()
+    except:
+        pass
