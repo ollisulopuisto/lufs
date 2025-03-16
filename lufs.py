@@ -32,16 +32,6 @@ install_dependencies()
 def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, lra_max=9.0):
     """
     Analyzes an audio file and adjusts its loudness to the target LUFS, considering short-term LUFS, true peak, and LRA.
-
-    Args:
-        input_file (str): Path to the input audio file.
-        output_file (str): Path to the output audio file.
-        target_lufs (float): Target LUFS level (default: -16.0).
-        true_peak (float): Maximum true peak level (default: -1.0).
-        lra_max (float): Maximum loudness range (default: 9.0).
-
-    Returns:
-        None
     """
     print(f"Normalizing audio: {input_file} -> {output_file}")
     try:
@@ -64,12 +54,6 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         print("Measuring integrated loudness...")
         loudness = meter.integrated_loudness(data)
         print(f"Input integrated loudness: {loudness} LUFS")
-        
-        # Skip normalization if input is too quiet
-        if loudness <= -70.0:  # Threshold for "too quiet"
-            print("Input audio is too quiet for meaningful normalization.")
-            sf.write(output_file, data, rate, subtype=subtype)
-            return
 
         # Calculate loudness difference
         print("Calculating loudness difference...")
@@ -80,24 +64,20 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         print("Applying gain...")
         normalized_data = data * (10**(loudness_diff/20))
 
-        # Ensure data stays within [-1, 1] range to prevent clipping
-        print("Clipping normalized data to [-1, 1]...")
-        normalized_data = np.clip(normalized_data, -1.0, 1.0)
-        print("Data clipped.")
-
         # Apply true peak limiting
         print("Applying true peak limiting...")
         normalized_data = apply_true_peak_limiting(normalized_data, rate, true_peak)
         print("True peak limiting applied.")
 
+        # Ensure data stays within [-1, 1] range to prevent clipping
+        print("Clipping normalized data to [-1, 1]...")
+        normalized_data = np.clip(normalized_data, -1.0, 1.0)
+        print("Data clipped.")
+
         # Re-measure after normalization (optional, for verification)        
         print("Measuring integrated loudness after normalization...")
         normalized_loudness = meter.integrated_loudness(normalized_data)
         print(f"Output integrated loudness: {normalized_loudness} LUFS")
-
-        #Further processing for true peak and LRA would require more sophisticated tools,
-        #as pyloudnorm doesn't directly provide methods to modify these parameters.
-        #You might need to explore other libraries or tools for precise control over true peak and LRA.
 
         # Write output audio
         print(f"Writing normalized audio to {output_file}...")
@@ -112,20 +92,24 @@ def apply_true_peak_limiting(data, rate, true_peak_limit=-1.0):
     import resampy
     from tqdm import tqdm
     
-    # Upsample for true peak measurement (typically 4x)
-    oversampled_data = resampy.resample(data, rate, rate * 4)
-    
-    # Find the maximum peak
-    true_peak = np.max(np.abs(oversampled_data))
-    true_peak_db = 20 * np.log10(true_peak) if true_peak > 0 else -np.inf
-    
-    # Apply gain reduction if needed
-    if true_peak_db > true_peak_limit:
-        gain_reduction = true_peak_limit - true_peak_db
+    with tqdm(total=3, desc="Applying true peak limiting", unit="step") as pbar:
+        # Upsample for true peak measurement (typically 4x)
+        oversampled_data = resampy.resample(data, rate, rate * 4)
+        pbar.update(1)
         
-        # Apply gain reduction with progress bar
-        for i in tqdm(range(len(data)), desc="Applying gain reduction"):
-            data[i] = data[i] * (10**(gain_reduction/20))
+        # Find the maximum peak
+        true_peak = np.max(np.abs(oversampled_data))
+        true_peak_db = 20 * np.log10(true_peak) if true_peak > 0 else -np.inf
+        pbar.update(1)
+        
+        # Apply gain reduction if needed
+        if true_peak_db > true_peak_limit:
+            gain_reduction = true_peak_limit - true_peak_db
+            
+            # Apply gain reduction with progress bar
+            for i in tqdm(range(len(data)), desc="Applying gain reduction"):
+                data[i] = data[i] * (10**(gain_reduction/20))
+        pbar.update(1)
     
     return data
 
