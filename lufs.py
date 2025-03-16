@@ -8,9 +8,56 @@ import subprocess
 import argparse
 from tqdm import tqdm
 import platform
+
+# Define the optimization functions first
+def enable_simd_optimizations():
+    """Enable CPU SIMD vectorization optimizations"""
+    import os
+    
+    # Use AVX2/SSE on Intel or NEON on ARM
+    os.environ['NPY_ENABLE_AVX2'] = '1'
+    os.environ['NPY_ENABLE_SSE41'] = '1'
+    os.environ['NPY_ENABLE_SSE42'] = '1'
+    
+    # Set numpy threading options
+    os.environ['NPY_NUM_THREADS'] = str(max(1, cpu_count() - 1))
+    
+    # Try to import numpy with optimizations enabled
+    try:
+        import numpy as np
+        np.__config__.show()
+    except:
+        pass
+
+def enable_optimizations():
+    """Enable all available optimizations at startup"""
+    # SIMD vectorization
+    enable_simd_optimizations()
+    
+    # Apple Silicon specific optimizations
+    if platform.system() == 'Darwin' and platform.machine() == 'arm64':
+        os.environ['ACCELERATE'] = '1'  # Use Accelerate framework
+        os.environ['OMP_NUM_THREADS'] = str(max(1, cpu_count() - 1))
+        os.environ['MKL_NUM_THREADS'] = str(max(1, cpu_count() - 1))
+        
+        # Try to enable Metal for PyTorch if available
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+                print("✓ Metal Performance Shaders enabled")
+        except ImportError:
+            pass
+    
+    return True
+
+# Apply Apple Silicon optimizations if available
 if platform.system() == 'Darwin' and platform.machine() == 'arm64':
     import os
     os.environ['ACCELERATE'] = '1'  # Use Accelerate framework
+
+# Apply optimizations immediately
+enable_optimizations()
 
 def install_dependencies():
     """
@@ -142,7 +189,7 @@ def measure_true_peak_efficient(data, rate):
     """
     # For very short files, upsample entirely
     if len(data) < 500000:
-        oversampled_data = resampy.resample(data, rate, rate * 4)
+        oversampled_data = optimized_resample(data, rate, rate * 4)  # Use optimized version
         true_peak = np.max(np.abs(oversampled_data))
     else:
         # For longer files, process in chunks
@@ -155,7 +202,7 @@ def measure_true_peak_efficient(data, rate):
             if i > 0:
                 chunk = np.concatenate([data[max(0, i-100):i], chunk])
             
-            oversampled_chunk = resampy.resample(chunk, rate, rate * 4)
+            oversampled_chunk = optimized_resample(chunk, rate, rate * 4)  # Use optimized version
             chunk_peak = np.max(np.abs(oversampled_chunk))
             max_peak = max(max_peak, chunk_peak)
         
@@ -666,7 +713,7 @@ def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_pea
         
         # Stage 3: Measure true peak after gain application
         print("Measuring true peak after gain...")
-        true_peak = measure_true_peak_streaming(current_file, chunk_size)
+        true_peak = measure_true_peak_streaming_parallel(current_file, chunk_size, num_processes)  # Use parallel version
         print(f"True peak after gain: {true_peak:.2f} dBTP")
         
         # Apply limiting if needed
@@ -686,46 +733,19 @@ def process_audio_streaming(input_file, output_file, target_lufs=-16.0, true_pea
         
         # Verify final output
         final_loudness = measure_loudness_streaming(output_file, meter, chunk_size)
-        final_tp = measure_true_peak_streaming(output_file, chunk_size)
+        final_tp = measure_true_peak_streaming_parallel(output_file, chunk_size, num_processes)  # Use parallel version
         print(f"Final measurements: {final_loudness:.2f} LUFS, {final_tp:.2f} dBTP")
-        
+
         return "Processing completed successfully"
-        
+
     finally:
         # Clean up temporary files
         for path in [temp1_path, temp2_path]:
             try:
                 if os.path.exists(path):
-                    os.unlink(path)
+                    os.unlink(path)  # This line needs to be indented
             except Exception as e:
                 print(f"Warning: Could not delete temporary file {path}: {e}")
-
-def process_stage(stage):
-    """Process a single stage in the audio pipeline"""
-    return stage['function'](stage['input'], stage['output'], **stage['args'])
-
-def analyze_lra_streaming(input_file, rate, meter, lra_max):
-    """
-    Analyze LRA in a memory-efficient way by processing chunks
-    """
-    # Window and hop size for short-term loudness calculation
-    window_size = int(3 * rate)  # 3 seconds
-    hop_size = int(0.1 * rate)   # 100ms
-    
-    # Create loudness history buffer
-    st_loudness = []
-    
-    # Process file in chunks
-    chunk_samples = int(5.0 * rate)  # 5 seconds chunks for reading
-    
-    with sf.SoundFile(input_file, 'r') as f:
-        # Read chunks and compute loudness
-        with tqdm(total=f.frames, desc="Analyzing loudness", unit="samples") as pbar:
-            while f.tell() < f.frames:
-                chunk = f.read(chunk_samples)
-                if len(chunk) == 0:
-                    break
-                    
                 # Create sliding windows in this chunk
                 for i in range(0, len(chunk) - window_size + 1, hop_size):
                     if i + window_size <= len(chunk):
@@ -1111,7 +1131,7 @@ def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_ti
                     
                     # CRUCIAL CHANGE: Upsample for true peak detection and limiting
                     oversampling_factor = 4
-                    oversampled_chunk = resampy.resample(chunk, rate, rate * oversampling_factor)
+                    oversampled_chunk = optimized_resample(chunk, rate, rate * oversampling_factor)  # Use optimized version
                     
                     # Calculate gain reduction based on oversampled signal
                     abs_data = np.abs(oversampled_chunk)
@@ -1134,7 +1154,7 @@ def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_ti
                     limited_oversampled = oversampled_chunk * gain_reduction
                     
                     # Downsample back to original rate
-                    limited_chunk = resampy.resample(limited_oversampled, rate * oversampling_factor, rate)
+                    limited_chunk = optimized_resample(limited_oversampled, rate * oversampling_factor, rate)  # Use optimized version
                     
                     # Write only the non-overlapping part except for last chunk
                     write_size = min(chunk_size, len(limited_chunk))
@@ -1146,7 +1166,7 @@ def apply_limiter_streaming(input_file, output_file, true_peak_limit, release_ti
                     
             # Final verification of true peak
             print("Verifying final true peak level...")
-            final_tp = measure_true_peak_streaming(output_file, chunk_seconds)
+            final_tp = measure_true_peak_streaming_parallel(output_file, chunk_seconds, num_processes=cpu_count() - 1)  # Use parallel version
             print(f"Final true peak after limiting: {final_tp:.2f} dBTP")
             
             # If still above threshold (unlikely), apply a final quick limiting pass
@@ -1225,7 +1245,7 @@ def measure_true_peak_streaming(audio_file, chunk_seconds=5.0):
                 
                 # Measure true peak in this chunk
                 # Use 4x oversampling for accurate peak measurement
-                oversampled_chunk = resampy.resample(chunk, rate, rate * 4)
+                oversampled_chunk = optimized_resample(chunk, rate, rate * 4)  # Use optimized version
                 chunk_peak = np.max(np.abs(oversampled_chunk))
                 if chunk_peak > 0:
                     chunk_peak_db = 20 * np.log10(chunk_peak)
@@ -1377,6 +1397,8 @@ def check_optimizations():
 if __name__ == "__main__":
     freeze_support()
     install_dependencies()
+    enable_simd_optimizations()  # Add SIMD optimizations
+    check_optimizations()        # Show optimization status
     main()
 
 def analyze_lra_streaming_optimized(input_file, rate, meter, lra_max):
@@ -1643,7 +1665,7 @@ def measure_chunk_true_peak(args):
         chunk = f.read(end - start)
     
     # Process with 4x oversampling
-    oversampled_chunk = resampy.resample(chunk, rate, rate * 4)
+    oversampled_chunk = optimized_resample(chunk, rate, rate * 4)  # Use optimized version
     chunk_peak = np.max(np.abs(oversampled_chunk))
     
     if chunk_peak > 0:
@@ -1957,3 +1979,9 @@ def enable_simd_optimizations():
         np.__config__.show()
     except:
         pass
+
+if __name__ == "__main__":
+    freeze_support()
+    install_dependencies()
+    check_optimizations()        # Show optimization status
+    main()
