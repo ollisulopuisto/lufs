@@ -28,12 +28,13 @@ def install_dependencies():
             print("You can create a venv with: python3 -m venv .venv")
             print("And activate it with: source .venv/bin/activate")
 
-def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, lra_max=9.0, num_processes=max(1, cpu_count() - 1)):
+def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak_limit=-1.0, lra_max=9.0, num_processes=max(1, cpu_count() - 1)):
     """
-    Analyzes and normalizes audio following best practices:
-    1. First adjust dynamic range (LRA)
-    2. Then normalize loudness
-    3. Finally apply true peak limiting
+    Analyzes and normalizes audio following user's preferred workflow:
+    1. Measure current loudness
+    2. Apply dynamic range processing (LRA) if needed
+    3. Apply LUFS normalization to target
+    4. Check true peak and apply brickwall limiting if needed
     """
     print(f"Normalizing audio: {input_file} -> {output_file}")
     try:
@@ -129,8 +130,8 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         
         if true_peak > true_peak_limit:
             print(f"Applying brickwall limiter to bring {true_peak:.2f} dBTP under {true_peak_limit:.2f} dBTP threshold")
-            # Use a more efficient limiting method
-            normalized_data = apply_efficient_limiter(normalized_data, rate, true_peak_limit)
+            # Use the brickwall limiter that only affects peaks (not overall gain)
+            normalized_data = apply_brickwall_limiter(normalized_data, rate, true_peak_limit)
             
             # Verify final true peak
             final_true_peak = measure_true_peak_efficient(normalized_data, rate)
@@ -149,6 +150,9 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
         return f"Successfully normalized {input_file} to {output_file}"
 
     except Exception as e:
+        import traceback
+        print(f"Error processing {input_file}: {str(e)}")
+        traceback.print_exc()
         return f"Error processing {input_file}: {str(e)}"
 
 def measure_true_peak_efficient(data, rate):
