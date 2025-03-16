@@ -92,31 +92,8 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak_limit=
                     
                     if current_lra > lra_max:
                         print(f"Applying compression to reduce LRA from {current_lra:.2f} to {lra_max:.2f} LU")
-                        # Simple compression algorithm - using numpy for speed
-                        # This is just a very basic compressor - would be better with a proper audio
-                        # processing library optimized for this purpose
-                        
-                        # Calculate ratio needed
-                        ratio = current_lra / lra_max
-                        threshold = st_loudness[p10_idx] + ((current_lra / 2) * (1 - 1/ratio))
-                        
-                        # Convert threshold to linear
-                        threshold_linear = 10 ** (threshold/20)
-                        
-                        # Apply compression
-                        abs_data = np.abs(data)
-                        gain_reduction = np.ones_like(abs_data)
-                        mask = abs_data > threshold_linear
-                        
-                        # Only apply to samples above threshold
-                        gain_reduction[mask] = (threshold_linear + 
-                                               ((abs_data[mask] - threshold_linear) / ratio)) / abs_data[mask]
-                        
-                        # Apply gain reduction
-                        processed_data = data * gain_reduction
-                        
-                        # Update data for next steps
-                        data = processed_data
+                        # Apply multi-stage compression
+                        data = apply_multi_stage_compression(data, rate, current_lra, lra_max)
                         
                         # Re-measure loudness after compression
                         compressed_loudness = meter.integrated_loudness(data)
@@ -1131,3 +1108,126 @@ if __name__ == "__main__":
     freeze_support()
     install_dependencies()
     main()
+
+def apply_multi_stage_compression(data, rate, current_lra, target_lra):
+    """
+    Apply multi-stage compression to reduce LRA in a more natural way
+    """
+    # Calculate how many stages we need (1 LU per stage)
+    lra_to_reduce = current_lra - target_lra
+    num_stages = min(8, max(1, int(np.ceil(lra_to_reduce))))
+    
+    print(f"Using {num_stages} compression stages to reduce LRA by {lra_to_reduce:.1f} LU")
+    
+    # Metadata to track changes
+    meter = pyln.Meter(rate)
+    original_loudness = meter.integrated_loudness(data)
+    
+    # Set up compressor parameters for each stage
+    stage_reduction = lra_to_reduce / num_stages
+    processed_data = data.copy()
+    
+    for stage in range(num_stages):
+        print(f"Stage {stage+1}/{num_stages}: Reducing LRA by {stage_reduction:.1f} LU")
+        
+        # Create a different threshold and ratio for each stage
+        if stage < num_stages/2:
+            # Early stages focus on peaks (higher threshold)
+            percentile = 60 + (20 * stage / (num_stages/2))
+        else:
+            # Later stages focus on body (lower threshold)
+            percentile = 40 - (20 * (stage - num_stages/2) / (num_stages/2))
+        
+        # Calculate compression parameters
+        loudness_values = []
+        window_size = int(1 * rate)  # 1-second window
+        hop_size = int(0.2 * rate)   # 200ms hop
+        
+        # Get some loudness values to determine threshold
+        for i in range(0, min(len(processed_data) - window_size, window_size * 50), hop_size):
+            window_data = processed_data[i:i + window_size]
+            window_loudness = meter.integrated_loudness(window_data)
+            if window_loudness > -70:  # Ignore silence
+                loudness_values.append(window_loudness)
+        
+        if not loudness_values:
+            continue
+            
+        loudness_values.sort()
+        threshold_idx = int(len(loudness_values) * (percentile/100))
+        threshold_loudness = loudness_values[threshold_idx]
+        
+        # Convert to linear domain
+        threshold_linear = 10 ** (threshold_loudness/20)
+        
+        # Use a gentler ratio for more transparent compression
+        ratio = 1.2 + (0.3 * stage)  # Gradually increase ratio
+        
+        # Apply attack and release (smoother than current implementation)
+        attack_time = 0.005 + (0.015 * stage / num_stages)  # 5-20ms
+        release_time = 0.050 + (0.150 * stage / num_stages)  # 50-200ms
+        
+        # Apply this stage of compression
+        processed_data = apply_compressor_with_time_constants(
+            processed_data, 
+            rate, 
+            threshold_linear,
+            ratio,
+            attack_time,
+            release_time
+        )
+        
+        # Re-measure stage progress
+        stage_loudness = meter.integrated_loudness(processed_data)
+        
+        # Maintain target loudness
+        gain_adjust = original_loudness - stage_loudness
+        processed_data = processed_data * (10**(gain_adjust/20))
+        
+    return processed_data
+
+def apply_compressor_with_time_constants(data, rate, threshold, ratio, attack_time, release_time):
+    """
+    Apply compression with proper attack and release time constants
+    """
+    from scipy import signal
+    
+    # Calculate time constants in samples
+    attack_samples = int(attack_time * rate)
+    release_samples = int(release_time * rate)
+    
+    # Create attack/release filters
+    attack_curve = 1 - np.exp(np.arange(attack_samples) / (-attack_samples/2))
+    release_curve = np.exp(np.arange(release_samples) / (-release_samples/5))
+    
+    # Calculate static gain reduction
+    abs_data = np.abs(data)
+    gain_reduction = np.ones_like(abs_data)
+    mask = abs_data > threshold
+    
+    if np.any(mask):
+        # Apply static gain reduction formula
+        gain_reduction[mask] = (threshold + ((abs_data[mask] - threshold) / ratio)) / abs_data[mask]
+        
+        # Apply time constants
+        if len(data.shape) > 1:  # Multi-channel
+            for c in range(data.shape[1]):
+                smoothed = np.ones_like(gain_reduction[:, c])
+                # Apply time constants with a state-machine approach
+                for i in range(1, len(gain_reduction[:, c])):
+                    if gain_reduction[i, c] < smoothed[i-1]:  # More reduction (attack)
+                        smoothed[i] = attack_curve[0] * gain_reduction[i, c] + (1 - attack_curve[0]) * smoothed[i-1]
+                    else:  # Less reduction (release)
+                        smoothed[i] = release_curve[0] * gain_reduction[i, c] + (1 - release_curve[0]) * smoothed[i-1]
+                gain_reduction[:, c] = smoothed
+        else:  # Mono
+            smoothed = np.ones_like(gain_reduction)
+            for i in range(1, len(gain_reduction)):
+                if gain_reduction[i] < smoothed[i-1]:  # More reduction (attack)
+                    smoothed[i] = attack_curve[0] * gain_reduction[i] + (1 - attack_curve[0]) * smoothed[i-1]
+                else:  # Less reduction (release)
+                    smoothed[i] = release_curve[0] * gain_reduction[i] + (1 - release_curve[0]) * smoothed[i-1]
+            gain_reduction = smoothed
+    
+    # Apply smoothed gain reduction
+    return data * gain_reduction
