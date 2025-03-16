@@ -57,42 +57,52 @@ def normalize_audio(input_file, output_file, target_lufs=-16.0, true_peak=-1.0, 
             subtype = f.subtype
         print(f"Original format: {subtype}, {rate} Hz")
 
-        # Initialize meter and measure loudness
+        # Measure initial loudness and true peak
         meter = pyln.Meter(rate)
         loudness = meter.integrated_loudness(data)
+        initial_true_peak = measure_true_peak(data, rate)
         print(f"Input integrated loudness: {loudness:.2f} LUFS")
-
-        # STEP 1: Check and apply true peak limiting first if needed
-        print(f"Checking true peak limit ({true_peak:.2f} dBTP)...")
-        data_peak_limited = check_true_peak(data, rate, true_peak, num_processes)
+        print(f"Input true peak: {initial_true_peak:.2f} dBTP")
         
-        # STEP 2: Re-measure loudness after true peak limiting
-        loudness_after_peak_limiting = meter.integrated_loudness(data_peak_limited)
-        if abs(loudness - loudness_after_peak_limiting) > 0.1:  # If true peak limiting changed loudness significantly
-            print(f"After true peak limiting: {loudness_after_peak_limiting:.2f} LUFS")
+        # Calculate the maximum gain we can apply while respecting the true peak limit
+        headroom = true_peak - initial_true_peak
+        loudness_diff = target_lufs - loudness
         
-        # STEP 3: Calculate loudness difference and apply gain
-        loudness_diff = target_lufs - loudness_after_peak_limiting
-        print(f"Target: {target_lufs:.2f} LUFS, difference: {loudness_diff:.2f} dB")
+        # If we need to increase gain but are limited by true peak
+        if loudness_diff > 0 and headroom < loudness_diff:
+            print(f"True peak limiting restricts gain - using {headroom:.2f} dB instead of {loudness_diff:.2f} dB")
+            applied_gain = headroom
+        else:
+            applied_gain = loudness_diff
         
-        # Apply gain for LUFS normalization
-        normalized_data = data_peak_limited * (10**(loudness_diff/20))
+        # Apply gain for LUFS normalization - FIX HERE! Use applied_gain instead of loudness_diff
+        normalized_data = data * (10**(applied_gain/20))
         
-        # STEP 4: Final true peak check and limiting if necessary
+        # Apply brickwall limiting if needed (for safety, in case true peak still exceeds limit)
         final_true_peak = measure_true_peak(normalized_data, rate)
-        print(f"Final true peak: {final_true_peak:.2f} dBTP")
-        
         if final_true_peak > true_peak:
-            gain_reduction = true_peak - final_true_peak
-            print(f"Applying final gain reduction of {gain_reduction:.2f} dB to meet true peak limit...")
-            normalized_data = normalized_data * (10**(gain_reduction/20))
+            print(f"Applying brickwall limiting to bring {final_true_peak:.2f} dBTP under {true_peak:.2f} dBTP threshold...")
+            normalized_data = apply_brickwall_limiter(normalized_data, rate, true_peak, 0.050, num_processes)
+            
+            # After brickwall limiting, check if we can add more gain to get closer to target LUFS
+            limited_loudness = meter.integrated_loudness(normalized_data)
+            limited_true_peak = measure_true_peak(normalized_data, rate)
+            remaining_headroom = true_peak - limited_true_peak
+            loudness_gap = target_lufs - limited_loudness
+            
+            # If we have headroom and loudness is below target, apply additional gain
+            if remaining_headroom > 0.2 and loudness_gap > 0.5:  # Add small buffers for safety
+                additional_gain = min(remaining_headroom - 0.1, loudness_gap)
+                print(f"After limiting: loudness {limited_loudness:.2f} LUFS, true peak {limited_true_peak:.2f} dBTP")
+                print(f"Applying additional gain of {additional_gain:.2f} dB to get closer to target")
+                normalized_data = normalized_data * (10**(additional_gain/20))
         
-        # Ensure data stays within [-1, 1] range
-        normalized_data = np.clip(normalized_data, -1.0, 1.0)
-
-        # Re-measure after normalization
+        # Re-measure final loudness
         normalized_loudness = meter.integrated_loudness(normalized_data)
         print(f"Output integrated loudness: {normalized_loudness:.2f} LUFS")
+
+        # Ensure data stays within [-1, 1] range
+        normalized_data = np.clip(normalized_data, -1.0, 1.0)
 
         # Write output audio
         sf.write(output_file, normalized_data, rate, subtype=subtype)
@@ -213,6 +223,66 @@ def apply_gain_reduction_chunk(args):
     """
     chunk, gain_reduction = args
     return chunk * (10**(gain_reduction/20))  # Vectorized operation for speed
+
+def apply_brickwall_limiter(data, rate, true_peak_limit=-1.0, release_time=0.050, num_processes=max(1, cpu_count() - 1)):
+    """
+    Apply a brickwall limiter that only affects peaks exceeding the threshold.
+    
+    Args:
+        data (ndarray): Audio data
+        rate (int): Sample rate
+        true_peak_limit (float): Maximum true peak level in dBTP
+        release_time (float): Release time in seconds
+        num_processes (int): Number of processes for parallel processing
+    
+    Returns:
+        ndarray: Limited audio data
+    """
+    from scipy import signal
+    import numpy as np
+    from tqdm import tqdm
+    
+    # Convert true peak limit from dB to linear
+    threshold_linear = 10 ** (true_peak_limit / 20.0)
+    
+    # Upsample for true peak detection (4x oversampling)
+    oversampled_data = resampy.resample(data, rate, rate * 4)
+    oversampled_rate = rate * 4
+    
+    # Calculate the gain reduction needed at each sample
+    abs_data = np.abs(oversampled_data)
+    gain_reduction = np.ones_like(abs_data)
+    
+    # Calculate gain reduction only where the signal exceeds the threshold
+    mask = abs_data > threshold_linear
+    gain_reduction[mask] = threshold_linear / abs_data[mask]
+    
+    # Create a smoothing filter for the gain reduction (release time)
+    release_samples = int(release_time * oversampled_rate)
+    if release_samples > 0:
+        # Create exponential release curve
+        release_curve = np.exp(-np.arange(release_samples) / (release_samples / 5))
+        release_curve = release_curve / np.sum(release_curve)  # Normalize
+        
+        # Apply the smoothing only to the gain reduction, not the original signal
+        # We want to look-ahead, so we reverse, filter, then reverse again
+        for channel in range(gain_reduction.shape[1] if len(gain_reduction.shape) > 1 else 1):
+            if len(gain_reduction.shape) > 1:
+                # Multi-channel
+                gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[:, channel][::-1])[::-1]
+                gain_reduction[:, channel] = np.minimum(gain_reduction[:, channel], gain_reduction_smooth)
+            else:
+                # Mono
+                gain_reduction_smooth = signal.lfilter(release_curve, [1.0], gain_reduction[::-1])[::-1]
+                gain_reduction = np.minimum(gain_reduction, gain_reduction_smooth)
+    
+    # Apply the smoothed gain reduction to the oversampled audio
+    limited_oversampled = oversampled_data * gain_reduction
+    
+    # Downsample back to original rate
+    limited_data = resampy.resample(limited_oversampled, oversampled_rate, rate)
+    
+    return limited_data
 
 def parallel_normalize_audio(input_files, output_files, target_lufs=-16.0, true_peak=-1.0, lra_max=9.0, num_processes=None):
     """
