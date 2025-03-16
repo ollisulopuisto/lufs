@@ -119,7 +119,7 @@ process_audio_streaming("input.wav", "output.wav", target_lufs=-16.0, true_peak_
 
 ## Technical Background
 
-LUFS (Loudness Units relative to Full Scale)
+### LUFS (Loudness Units relative to Full Scale)
 
 LUFS is an absolute loudness measurement standardized in ITU-R BS.1770. Streaming platforms and broadcast standards have specific LUFS targets:
 
