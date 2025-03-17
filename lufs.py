@@ -1,4 +1,4 @@
-'import pyloudnorm as pyln
+import pyloudnorm as pyln
 import soundfile as sf
 import numpy as np
 import os
@@ -10,7 +10,7 @@ from tqdm import tqdm
 import platform
 
 # Define the optimization functions first
-def enable_simd_optimizations():
+def enable_simd_optimizations(verbose=False):
     """Enable CPU SIMD vectorization optimizations"""
     import os
     
@@ -22,17 +22,18 @@ def enable_simd_optimizations():
     # Set numpy threading options
     os.environ['NPY_NUM_THREADS'] = str(max(1, cpu_count() - 1))
     
-    # Try to import numpy with optimizations enabled
-    try:
-        import numpy as np
-        np.__config__.show()
-    except:
-        pass
+    # Only show numpy config details if verbose mode is enabled
+    if verbose:
+        try:
+            import numpy as np
+            np.__config__.show()
+        except:
+            pass
 
-def enable_optimizations():
+def enable_optimizations(verbose=False):
     """Enable all available optimizations at startup"""
     # SIMD vectorization
-    enable_simd_optimizations()
+    enable_simd_optimizations(verbose)
     
     # Apple Silicon specific optimizations
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
@@ -45,7 +46,8 @@ def enable_optimizations():
             import torch
             if torch.backends.mps.is_available():
                 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-                print("✓ Metal Performance Shaders enabled")
+                if verbose:
+                    print("✓ Metal Performance Shaders enabled")
         except ImportError:
             pass
     
@@ -1320,7 +1322,10 @@ def main():
                           help="Size of processing chunks in seconds (default: 5.0)")
     perf_group.add_argument("--no-cache", action="store_true", 
                           help="Disable caching of loudness analysis results")
-    
+    perf_group.add_argument("-v", "--verbose", action="store_true",
+                          help="Show detailed optimization and processing information")
+   
+
     # Handle the remaining arguments as lists of input/output files
     args, remaining = parser.parse_known_args()
     
@@ -1358,48 +1363,43 @@ def main():
                               args.lra_max, args.num_processes,
                               args.chunk_size, use_cache)
 
-def check_optimizations():
+def check_optimizations(verbose=False):
     """Check if running optimized libraries for current architecture"""
     import numpy as np
-    print("\nLibrary optimization check:")
     
-    # Check if running on Apple Silicon
-    import platform
-    is_apple_silicon = platform.system() == 'Darwin' and platform.machine() == 'arm64'
-    print(f"Running on Apple Silicon: {is_apple_silicon}")
-    
-    # Check NumPy config
-    print(f"NumPy version: {np.__version__}")
-    try:
-        # Try to get BLAS info
-        blas_info = np.__config__.get_info('blas_opt')
-        if 'accelerate' in str(blas_info).lower():
-            print("NumPy: Using Apple Accelerate framework ✓")
-        elif 'mkl' in str(blas_info).lower():
-            print("NumPy: Using Intel MKL")
-        elif 'openblas' in str(blas_info).lower():
-            print("NumPy: Using OpenBLAS")
-        else:
-            print("NumPy: Using standard BLAS implementation")
-    except:
-        print("Couldn't determine NumPy BLAS implementation")
+    if verbose:
+        print("\nLibrary optimization check:")
         
-    # Check if OpenMP is available for parallel processing
-    try:
-        from scipy import __config__
-        if 'openmp' in str(__config__.get_info('ALL')).lower():
-            print("SciPy: OpenMP enabled for parallel processing ✓")
-        else:
-            print("SciPy: OpenMP not detected")
-    except:
-        print("Couldn't determine SciPy parallelization")
-
-if __name__ == "__main__":
-    freeze_support()
-    install_dependencies()
-    enable_simd_optimizations()  # Add SIMD optimizations
-    check_optimizations()        # Show optimization status
-    main()
+        # Check if running on Apple Silicon
+        import platform
+        is_apple_silicon = platform.system() == 'Darwin' and platform.machine() == 'arm64'
+        print(f"Running on Apple Silicon: {is_apple_silicon}")
+        
+        # Check NumPy config
+        print(f"NumPy version: {np.__version__}")
+        try:
+            # Try to get BLAS info
+            blas_info = np.__config__.get_info('blas_opt')
+            if 'accelerate' in str(blas_info).lower():
+                print("NumPy: Using Apple Accelerate framework ✓")
+            elif 'mkl' in str(blas_info).lower():
+                print("NumPy: Using Intel MKL")
+            elif 'openblas' in str(blas_info).lower():
+                print("NumPy: Using OpenBLAS")
+            else:
+                print("NumPy: Using standard BLAS implementation")
+        except:
+            print("Couldn't determine NumPy BLAS implementation")
+            
+        # Check if OpenMP is available for parallel processing
+        try:
+            from scipy import __config__
+            if 'openmp' in str(__config__.get_info('ALL')).lower():
+                print("SciPy: OpenMP enabled for parallel processing ✓")
+            else:
+                print("SciPy: OpenMP not detected")
+        except:
+            print("Couldn't determine SciPy parallelization")
 
 def analyze_lra_streaming_optimized(input_file, rate, meter, lra_max):
     """
@@ -1866,7 +1866,7 @@ def metal_optimized_gain(input_tensor, gain_db):
     gain_linear = 10 ** (gain_db / 20.0)
     return input_tensor * gain_linear
 
-def setup_apple_silicon_optimizations():
+def setup_apple_silicon_optimizations(verbose=False):
     """Configure environment for optimal performance on Apple Silicon"""
     import platform
     
@@ -1884,11 +1884,13 @@ def setup_apple_silicon_optimizations():
             import torch
             if torch.backends.mps.is_available():
                 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-                print("Metal Performance Shaders enabled for PyTorch acceleration")
+                if verbose:
+                    print("Metal Performance Shaders enabled for PyTorch acceleration")
         except ImportError:
             pass
             
-        print("Optimizations enabled for Apple Silicon")
+        if verbose:
+            print("Optimizations enabled for Apple Silicon")
     
     # Always return True so this can be used in an if statement
     return True
@@ -1961,27 +1963,18 @@ def process_audio_streaming_parallel(input_file, output_file, target_lufs=-16.0,
         final_loudness = loudness_task.get()
         final_tp = peak_task.get()
 
-def enable_simd_optimizations():
-    """Enable CPU SIMD vectorization optimizations"""
-    import os
-    
-    # Use AVX2/SSE on Intel or NEON on ARM
-    os.environ['NPY_ENABLE_AVX2'] = '1'
-    os.environ['NPY_ENABLE_SSE41'] = '1'
-    os.environ['NPY_ENABLE_SSE42'] = '1'
-    
-    # Set numpy threading options
-    os.environ['NPY_NUM_THREADS'] = str(max(1, cpu_count() - 1))
-    
-    # Try to import numpy with optimizations enabled
-    try:
-        import numpy as np
-        np.__config__.show()
-    except:
-        pass
-
 if __name__ == "__main__":
+    # Parse args just to get verbose flag
+    import sys
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args, _ = parser.parse_known_args()
+    verbose = args.verbose
+    
+    # Apply optimizations but respect verbose flag
+    enable_optimizations(verbose)
     freeze_support()
     install_dependencies()
+    enable_simd_optimizations()  # Add SIMD optimizations
     check_optimizations()        # Show optimization status
     main()
