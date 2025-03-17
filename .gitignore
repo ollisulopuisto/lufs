@@ -1,3 +1,12 @@
 .lufs_cache
 .venv
 *wav
+__pycache__/cli.cpython-39.pyc
+__pycache__/compression.cpython-39.pyc
+__pycache__/core.cpython-39.pyc
+__pycache__/dependencies.cpython-39.pyc
+__pycache__/loudness.cpython-39.pyc
+__pycache__/optimization.cpython-39.pyc
+__pycache__/peak_limiting.cpython-39.pyc
+__pycache__/resampling.cpython-39.pyc
+__pycache__/utils.cpython-39.pyc

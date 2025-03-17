@@ -10,7 +10,7 @@ from tqdm import tqdm
 import platform
 
 # Define the optimization functions first
-def enable_simd_optimizations():
+def enable_simd_optimizations(verbose=False):
     """Enable CPU SIMD vectorization optimizations"""
     import os
     
@@ -22,17 +22,19 @@ def enable_simd_optimizations():
     # Set numpy threading options
     os.environ['NPY_NUM_THREADS'] = str(max(1, cpu_count() - 1))
     
-    # Try to import numpy with optimizations enabled
-    try:
-        import numpy as np
-        np.__config__.show()
-    except:
-        pass
+    # Only show extended config when verbose mode is on
+    if verbose:
+        try:
+            import numpy as np
+            print("NumPy configuration details:")
+            np.__config__.show()
+        except:
+            pass
 
-def enable_optimizations():
+def enable_optimizations(verbose=False):
     """Enable all available optimizations at startup"""
     # SIMD vectorization
-    enable_simd_optimizations()
+    enable_simd_optimizations(verbose)
     
     # Apple Silicon specific optimizations
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
@@ -45,7 +47,8 @@ def enable_optimizations():
             import torch
             if torch.backends.mps.is_available():
                 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-                print("✓ Metal Performance Shaders enabled")
+                if verbose:
+                    print("✓ Metal Performance Shaders enabled")
         except ImportError:
             pass
     
@@ -1320,6 +1323,8 @@ def main():
                           help="Size of processing chunks in seconds (default: 5.0)")
     perf_group.add_argument("--no-cache", action="store_true", 
                           help="Disable caching of loudness analysis results")
+    perf_group.add_argument("-v", "--verbose", action="store_true",
+                          help="Show detailed optimization and processing information")
     
     # Handle the remaining arguments as lists of input/output files
     args, remaining = parser.parse_known_args()
@@ -1358,47 +1363,52 @@ def main():
                               args.lra_max, args.num_processes,
                               args.chunk_size, use_cache)
 
-def check_optimizations():
+def check_optimizations(verbose=False):
     """Check if running optimized libraries for current architecture"""
     import numpy as np
-    print("\nLibrary optimization check:")
     
-    # Check if running on Apple Silicon
-    import platform
-    is_apple_silicon = platform.system() == 'Darwin' and platform.machine() == 'arm64'
-    print(f"Running on Apple Silicon: {is_apple_silicon}")
-    
-    # Check NumPy config
-    print(f"NumPy version: {np.__version__}")
-    try:
-        # Try to get BLAS info
-        blas_info = np.__config__.get_info('blas_opt')
-        if 'accelerate' in str(blas_info).lower():
-            print("NumPy: Using Apple Accelerate framework ✓")
-        elif 'mkl' in str(blas_info).lower():
-            print("NumPy: Using Intel MKL")
-        elif 'openblas' in str(blas_info).lower():
-            print("NumPy: Using OpenBLAS")
-        else:
-            print("NumPy: Using standard BLAS implementation")
-    except:
-        print("Couldn't determine NumPy BLAS implementation")
+    if verbose:
+        print("\nLibrary optimization check:")
         
-    # Check if OpenMP is available for parallel processing
-    try:
-        from scipy import __config__
-        if 'openmp' in str(__config__.get_info('ALL')).lower():
-            print("SciPy: OpenMP enabled for parallel processing ✓")
-        else:
-            print("SciPy: OpenMP not detected")
-    except:
-        print("Couldn't determine SciPy parallelization")
+        # Check if running on Apple Silicon
+        import platform
+        is_apple_silicon = platform.system() == 'Darwin' and platform.machine() == 'arm64'
+        print(f"Running on Apple Silicon: {is_apple_silicon}")
+        
+        # Check NumPy config
+        print(f"NumPy version: {np.__version__}")
+        try:
+            # Try to get BLAS info
+            blas_info = np.__config__.get_info('blas_opt')
+            if 'accelerate' in str(blas_info).lower():
+                print("NumPy: Using Apple Accelerate framework ✓")
+            elif 'mkl' in str(blas_info).lower():
+                print("NumPy: Using Intel MKL")
+            elif 'openblas' in str(blas_info).lower():
+                print("NumPy: Using OpenBLAS")
+            else:
+                print("NumPy: Using standard BLAS implementation")
+        except:
+            print("Couldn't determine NumPy BLAS implementation")
+            
+        # Check if OpenMP is available for parallel processing
+        try:
+            from scipy import __config__
+            if 'openmp' in str(__config__.get_info('ALL')).lower():
+                print("SciPy: OpenMP enabled for parallel processing ✓")
+            else:
+                print("SciPy: OpenMP not detected")
+        except:
+            print("Couldn't determine SciPy parallelization")
 
 if __name__ == "__main__":
     freeze_support()
     install_dependencies()
-    enable_simd_optimizations()  # Add SIMD optimizations
-    check_optimizations()        # Show optimization status
+    # Parse args just to get verbose flag
+    import sys
+    verbose = "--verbose" in sys.argv or "-v" in sys.argv
+    enable_simd_optimizations(verbose)  # Only show details if verbose
+    check_optimizations(verbose)        # Show optimization status
     main()
 
 def analyze_lra_streaming_optimized(input_file, rate, meter, lra_max):
@@ -1573,16 +1583,6 @@ def analyze_lra_streaming_optimized(input_file, rate, meter, lra_max):
         main_pbar.update(stage_weights[2])
         
         return result
-
-def measure_loudness_wrapper(args):
-    """Wrapper function for parallel processing"""
-    window_data, meter = args
-    try:
-        return meter.integrated_loudness(window_data)
-    except:
-        return -120.0  # Return very low value on failure
-
-def measure_exact_lra(data, rate, meter):
     """
     Measure LRA with progress bar and parallel processing
     """
@@ -1762,7 +1762,7 @@ def apply_multi_stage_compression_parallel(data, rate, current_lra, target_lra, 
     pool.join()
     
     # Measure final LRA
-    # ... (your existing LRA measurement code) ...
+    # WRITE THE MISSING CODE!
     
     return processed_data
 
